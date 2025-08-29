@@ -23,6 +23,10 @@ from textblob import TextBlob
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from dotenv import load_dotenv
+
+# טעינת environment variables
+load_dotenv()
 
 # הגדרת logging
 logging.basicConfig(
@@ -42,6 +46,14 @@ class AdvancedSwingTradingBot:
         self.scaler = StandardScaler()
         self.portfolio = {}
         self.performance_history = []
+        
+        # טעינת API keys מ-environment variables
+        self.api_keys = {
+            'news_api': os.getenv('NEWS_API_KEY'),
+            'alpha_vantage': os.getenv('ALPHA_VANTAGE_KEY'),
+            'telegram_bot': os.getenv('TELEGRAM_BOT_TOKEN'),
+            'telegram_chat_id': os.getenv('TELEGRAM_CHAT_ID')
+        }
         
     def load_custom_tickers(self) -> List[str]:
         """טעינת רשימת מניות מותאמת אישית מקובץ JSON"""
@@ -134,22 +146,63 @@ class AdvancedSwingTradingBot:
         return df
     
     def get_news_sentiment(self, ticker: str) -> float:
-        """קבלת סנטימנט מחדשות (דמו - ניתן להחליף עם News API אמיתי)"""
+        """קבלת סנטימנט מחדשות עם News API"""
         try:
-            # במקום אמיתי, יש להשתמש ב-News API עם מפתח אמיתי
-            # דמו - סנטימנט אקראי לצורך הדגמה
-            sentiment_score = np.random.uniform(-0.5, 0.5)
-            return sentiment_score
+            if not self.api_keys['news_api']:
+                logger.warning("News API key not configured. Using demo sentiment.")
+                return np.random.uniform(-0.5, 0.5)
+            
+            # שימוש ב-News API אמיתי
+            url = f"https://newsapi.org/v2/everything?q={ticker}&apiKey={self.api_keys['news_api']}"
+            response = requests.get(url)
+            
+            if response.status_code == 200:
+                articles = response.json().get('articles', [])
+                sentiments = []
+                
+                for article in articles[:10]:  # ניתוח 10 המאמרים הראשונים
+                    if article['title'] and article['description']:
+                        text = f"{article['title']}. {article['description']}"
+                        analysis = TextBlob(text)
+                        sentiments.append(analysis.sentiment.polarity)
+                
+                if sentiments:
+                    return sum(sentiments) / len(sentiments)
+                else:
+                    return 0
+            else:
+                logger.error(f"News API error: {response.status_code}")
+                return 0
+                
         except Exception as e:
             logger.error(f"Error getting news sentiment for {ticker}: {e}")
             return 0
     
     def get_social_sentiment(self, ticker: str) -> float:
-        """קבלת סנטימנט מרשתות חברתיות (דמו)"""
+        """קבלת סנטימנט מרשתות חברתיות"""
         try:
-            # כאן יש לשלב API של Twitter או Reddit
-            sentiment_score = np.random.uniform(-0.3, 0.3)
-            return sentiment_score
+            # כאן יש לשלב API של Twitter או Reddi
+            # לדוגמה, שימוש ב-Alpha Vantage עבור sentiment
+            if not self.api_keys['alpha_vantage']:
+                logger.warning("Alpha Vantage API key not configured. Using demo sentiment.")
+                return np.random.uniform(-0.3, 0.3)
+            
+            url = f"https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers={ticker}&apikey={self.api_keys['alpha_vantage']}"
+            response = requests.get(url)
+            
+            if response.status_code == 200:
+                data = response.json()
+                feed = data.get('feed', [])
+                
+                if feed:
+                    sentiments = [float(item.get('overall_sentiment_score', 0)) for item in feed[:5]]
+                    return sum(sentiments) / len(sentiments) if sentiments else 0
+                else:
+                    return 0
+            else:
+                logger.error(f"Alpha Vantage API error: {response.status_code}")
+                return 0
+                
         except Exception as e:
             logger.error(f"Error getting social sentiment for {ticker}: {e}")
             return 0
@@ -463,8 +516,12 @@ class AdvancedSwingTradingBot:
         logger.info("Visualization created: trading_signals.html")
     
     def send_telegram_alert(self, signals: List[Dict]):
-        """שליח� התראות ל-Telegram"""
+        """שליחת התראות ל-Telegram"""
         try:
+            if not self.api_keys['telegram_bot'] or not self.api_keys['telegram_chat_id']:
+                logger.warning("Telegram credentials not configured. Skipping alerts.")
+                return
+                
             if not signals:
                 message = "📊 No trading signals generated today."
             else:
@@ -478,12 +535,20 @@ class AdvancedSwingTradingBot:
                         f"   Confidence: {signal['confidence']:.2f}, R/R: {signal['risk_reward_ratio']:.2f}\n\n"
                     )
             
-            # כאן יש להוסיף את הקוד לשליחה ל-Telegram
-            # לדוגמה עם requests:
-            # requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", 
-            #              json={"chat_id": TELEGRAM_CHAT_ID, "text": message})
+            # שליחה ל-Telegram
+            url = f"https://api.telegram.org/bot{self.api_keys['telegram_bot']}/sendMessage"
+            payload = {
+                "chat_id": self.api_keys['telegram_chat_id'],
+                "text": message,
+                "parse_mode": "HTML"
+            }
             
-            logger.info("Telegram message prepared (uncomment code to actually send)")
+            response = requests.post(url, json=payload)
+            
+            if response.status_code == 200:
+                logger.info("Telegram alert sent successfully")
+            else:
+                logger.error(f"Failed to send Telegram alert: {response.status_code}")
             
         except Exception as e:
             logger.error(f"Error sending Telegram alert: {e}")
@@ -498,7 +563,7 @@ class AdvancedSwingTradingBot:
         # יצירת ויזואליזציה
         self.create_visualization(signals)
         
-        # שליח� התראות
+        # שליחת התראות
         self.send_telegram_alert(signals)
         
         # שמירת התוצאות
