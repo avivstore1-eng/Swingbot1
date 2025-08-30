@@ -1,0 +1,82 @@
+name: Daily Trading Bot Analysis
+
+on:
+  schedule:
+    - cron: '0 9 * * 1-5'   # ריצה אוטומטית כל יום עסקים ב-09:00 UTC
+  workflow_dispatch:         # מאפשר הפעלה ידנית
+
+jobs:
+  run-trading-bot:
+    runs-on: ubuntu-latest
+
+    env:
+      NEWS_API_KEY: ${{ secrets.NEWS_API_KEY }}
+      ALPHA_VANTAGE_KEY: ${{ secrets.ALPHA_VANTAGE_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install TA-Lib system dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ta-lib
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r Requirements.txt
+
+      - name: Run trading bot
+        run: |
+          echo "Running trading bot..."
+          python Main.py
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trading-results-${{ github.run_id }}
+          path: |
+            trading_signals.json
+            trading_signals.html
+            trading_bot.log
+
+      - name: Send Telegram notification
+        if: always()
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "Telegram secrets not set, skipping notification."
+            exit 0
+          fi
+
+          if [ -f trading_signals.json ]; then
+            SIGNALS=$(python - <<'EOF'
+import json
+try:
+    with open("trading_signals.json") as f:
+        data = json.load(f)
+    print(data.get("signals_generated", 0))
+except:
+    print(0)
+EOF
+)
+            if [ "$SIGNALS" -gt 0 ]; then
+              MESSAGE="🤖 Trading Bot Complete - Generated $SIGNALS signals"
+            else
+              MESSAGE="🤖 Trading Bot Complete - No signals generated today."
+            fi
+          else
+            MESSAGE="❌ Trading Bot Failed - Error running bot"
+          fi
+
+          curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+            -d chat_id="$TELEGRAM_CHAT_ID" \
+            -d text="$MESSAGE"
