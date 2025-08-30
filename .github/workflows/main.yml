@@ -5,16 +5,16 @@ on:
     - cron: '0 9 * * 1-5'  # ירוץ כל יום עסקים ב-9:00 בבוקר (UTC)
   workflow_dispatch:  # מאפשר הרצה ידנית
 
-env:
-  NEWS_API_KEY: ${{ secrets.NEWS_API_KEY }}
-  ALPHA_VANTAGE_KEY: ${{ secrets.ALPHA_VANTAGE_KEY }}
-  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-  TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
 jobs:
   run-trading-bot:
     runs-on: ubuntu-latest
     
+    env:
+      NEWS_API_KEY: ${{ secrets.NEWS_API_KEY }}
+      ALPHA_VANTAGE_KEY: ${{ secrets.ALPHA_VANTAGE_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -22,133 +22,19 @@ jobs:
         fetch-depth: 0
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.10'
 
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential libta-lib-dev
-
-    - name: Verify repository structure
-      run: |
-        echo "Repository contents:"
-        ls -la
-        echo "Requirements file exists:"
-        if [ -f requirements.txt ]; then
-          echo "✓ requirements.txt found"
-          cat requirements.txt
-        else
-          echo "✗ requirements.txt not found - creating it"
-          cat > requirements.txt << 'EOF'
-pandas>=1.5.0
-numpy>=1.23.0
-yfinance>=0.2.18
-scikit-learn>=1.2.0
-textblob>=0.17.1
-requests>=2.28.0
-matplotlib>=3.6.0
-plotly>=5.11.0
-python-dotenv>=0.19.0
-schedule>=1.2.0
-backtrader>=1.9.76.123
-alpha-vantage>=2.3.1
-TA-Lib>=0.4.24
-EOF
-        fi
+        sudo apt-get install -y build-essential ta-lib
 
     - name: Install Python dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-
-    - name: Create config files if missing
-      run: |
-        if [ ! -f tickers.json ]; then
-          echo "Creating tickers.json..."
-          echo '{"tickers": ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "NVDA", "JPM", "V", "JNJ"]}' > tickers.json
-        fi
-        
-        if [ ! -f config.py ]; then
-          echo "Creating config.py..."
-          cat > config.py << 'EOF'
-"""
-קובץ הגדרות מתקדם עבור Swing Trading Bot
-"""
-
-import os
-from datetime import time
-from typing import List, Dict, Any
-
-# רשימת מניות default (ניתן לשנות דרך הקוד או הקובץ)
-DEFAULT_TICKERS = [
-    'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 
-    'TSLA', 'NVDA', 'JPM', 'V', 'JNJ'
-]
-
-# הגדרות ניתוח טכני
-TECHNICAL_SETTINGS = {
-    'rsi_overbought': 70,
-    'rsi_oversold': 30,
-    'bb_std_dev': 2,
-    'ema_periods': [20, 50, 200],
-    'macd_fast': 12,
-    'macd_slow': 26,
-    'macd_signal': 9,
-    'atr_period': 14,
-    'adx_period': 14,
-    'stochastic_period': 14
-}
-
-# הגדרות ניהול סיכונים מתקדמות
-RISK_MANAGEMENT = {
-    'max_position_size': 0.1,
-    'stop_loss_pct': 0.08,
-    'trailing_stop_pct': 0.05,
-    'take_profit_pct': 0.15,
-    'max_drawdown': 0.2,
-    'consecutive_losses': 3,
-    'min_risk_reward': 1.5
-}
-
-# הגדרות אסטרטגיות
-STRATEGY_SETTINGS = {
-    'trend_following': {'enabled': True, 'min_adx': 25, 'min_volume_ratio': 1.2},
-    'mean_reversion': {'enabled': True, 'max_adx': 20, 'min_volume_ratio': 1.5},
-    'breakout': {'enabled': True, 'min_volume_ratio': 1.8, 'min_adx': 20}
-}
-
-# הגדרות ML
-ML_SETTINGS = {
-    'enabled': True,
-    'model_type': 'gradient_boosting',
-    'test_size': 0.2,
-    'random_state': 42,
-    'n_estimators': 100,
-    'learning_rate': 0.1,
-    'max_depth': 3
-}
-
-# הגדרות נתונים
-DATA_SETTINGS = {
-    'default_period': '6mo',
-    'default_interval': '1d',
-    'max_retries': 3,
-    'retry_delay': 1,
-    'cache_expiry': 300
-}
-
-# הגדרות logging
-LOGGING_SETTINGS = {
-    'level': 'INFO',
-    'format': '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    'log_file': 'trading_bot.log',
-    'max_bytes': 10485760,
-    'backup_count': 5
-}
-EOF
-        fi
 
     - name: Run trading bot
       run: |
@@ -164,39 +50,34 @@ EOF
           trading_signals.json
           trading_signals.html
           trading_bot.log
-          requirements.txt
-          tickers.json
-          config.py
 
     - name: Send Telegram notification
       if: always()
-      env:
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       run: |
+        if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+          echo "Telegram secrets not set, skipping notification."
+          exit 0
+        fi
+
         if [ -f trading_signals.json ]; then
           SIGNALS=$(python -c "
-          import json
-          try:
-              with open('trading_signals.json') as f:
-                  data = json.load(f)
-              print(data.get('signals_generated', 0))
-          except:
-              print(0)
-          ")
-          
+import json
+try:
+    with open('trading_signals.json') as f:
+        data = json.load(f)
+    print(data.get('signals_generated', 0))
+except:
+    print(0)
+")
           if [ "$SIGNALS" -gt 0 ]; then
-            MESSAGE="🤖 Trading Bot Complete - Generated $SIGNALS signals"
-            curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
-              -d chat_id="$TELEGRAM_CHAT_ID" \
-              -d text="$MESSAGE"
+            MESSAGE=\"🤖 Trading Bot Complete - Generated $SIGNALS signals\"
           else
-            curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
-              -d chat_id="$TELEGRAM_CHAT_ID" \
-              -d text="🤖 Trading Bot Complete - No signals generated today."
+            MESSAGE=\"🤖 Trading Bot Complete - No signals generated today.\"
           fi
         else
-          curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
-            -d chat_id="$TELEGRAM_CHAT_ID" \
-            -d text="❌ Trading Bot Failed - Error running bot"
+          MESSAGE=\"❌ Trading Bot Failed - Error running bot\"
         fi
+
+        curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+          -d chat_id="$TELEGRAM_CHAT_ID" \
+          -d text="$MESSAGE"
