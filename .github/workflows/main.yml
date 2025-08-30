@@ -24,19 +24,47 @@ jobs:
       with:
         python-version: '3.10'
 
-    - name: Install dependencies
+    - name: Install system dependencies for TA-Lib
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential libta-lib-dev
+
+    - name: Create requirements.txt if missing
+      run: |
+        if [ ! -f requirements.txt ]; then
+          echo "Creating requirements.txt file..."
+          cat > requirements.txt << EOF
+pandas>=1.5.0
+numpy>=1.23.0
+yfinance>=0.2.18
+scikit-learn>=1.2.0
+textblob>=0.17.1
+requests>=2.28.0
+matplotlib>=3.6.0
+plotly>=5.11.0
+python-dotenv>=0.19.0
+schedule>=1.2.0
+backtrader>=1.9.76.123
+alpha-vantage>=2.3.1
+TA-Lib>=0.4.24
+EOF
+        fi
+
+    - name: Install Python dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
     - name: Create default tickers file
       run: |
-        echo '{
-          "tickers": [
-            "AAPL", "MSFT", "GOOGL", "AMZN", "META",
-            "TSLA", "NVDA", "JPM", "V", "JNJ"
-          ]
-        }' > tickers.json
+        if [ ! -f tickers.json ]; then
+          echo '{
+            "tickers": [
+              "AAPL", "MSFT", "GOOGL", "AMZN", "META",
+              "TSLA", "NVDA", "JPM", "V", "JNJ"
+            ]
+          }' > tickers.json
+        fi
 
     - name: Run trading bot
       run: |
@@ -72,16 +100,16 @@ jobs:
                 print(f'{signal[\"ticker\"]}: {signal[\"action\"]} at ${signal[\"price\"]:.2f}')
             ")
             
-            curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
-              -d chat_id="$TELEGRAM_CHAT_ID" \
+            curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+              -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
               -d text="🤖 Trading Bot Complete - Generated $SIGNALS signals. Top: $TOP_SIGNAL"
           else
-            curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
-              -d chat_id="$TELEGRAM_CHAT_ID" \
+            curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+              -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
               -d text="🤖 Trading Bot Complete - No signals generated today."
           fi
         else
-          curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
-            -d chat_id="$TELEGRAM_CHAT_ID" \
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
             -d text="❌ Trading Bot Failed - Error running bot"
         fi
