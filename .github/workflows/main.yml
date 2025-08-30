@@ -70,12 +70,12 @@ except:
     print(0)
 ")
           if [ "$SIGNALS" -gt 0 ]; then
-            MESSAGE=\"🤖 Trading Bot Complete - Generated $SIGNALS signals\"
+            MESSAGE="🤖 Trading Bot Complete - Generated $SIGNALS signals"
           else
-            MESSAGE=\"🤖 Trading Bot Complete - No signals generated today.\"
+            MESSAGE="🤖 Trading Bot Complete - No signals generated today."
           fi
         else
-          MESSAGE=\"❌ Trading Bot Failed - Error running bot\"
+          MESSAGE="❌ Trading Bot Failed - Error running bot"
         fi
 
         curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
