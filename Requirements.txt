@@ -11,5 +11,3 @@ schedule>=1.2.0
 backtrader>=1.9.76.123
 alpha-vantage>=2.3.1
 TA-Lib>=0.4.24
-logging>=0.4.9.6
-types-requests>=2.28.0
