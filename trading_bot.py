@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Advanced Swing Trading Bot 10/10 – Full Version
-Free, GitHub Actions ready, no TA-Lib, no Alpha Vantage
+Free, GitHub Actions ready, no TA-Lib, no Alpha Vantage, JSON tickers
 """
 
 import pandas as pd
@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 import time
 import os
 import logging
+import json
 from typing import Dict, List, Optional
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
@@ -30,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 class AdvancedSwingTradingBot:
     def __init__(self):
-        self.tickers = self.load_tickers()  # Load tickers from file or default
+        self.tickers = self.load_tickers()  # Load tickers from JSON or default
         self.model = None
         self.scaler = StandardScaler()
         self.portfolio = {}
@@ -45,16 +46,18 @@ class AdvancedSwingTradingBot:
 
     # ----------------- Ticker Management -----------------
     def load_tickers(self) -> List[str]:
-        """Load tickers from tickers.txt if exists, else use default."""
-        if os.path.exists('tickers.txt'):
+        """Load tickers from tickers.json if exists, else use default."""
+        if os.path.exists('tickers.json'):
             try:
-                with open('tickers.txt', 'r') as f:
-                    tickers = [line.strip() for line in f if line.strip()]
-                logger.info(f"Loaded {len(tickers)} tickers from tickers.txt")
+                with open('tickers.json', 'r') as f:
+                    tickers = json.load(f)
+                if not isinstance(tickers, list) or not all(isinstance(t, str) for t in tickers):
+                    raise ValueError("tickers.json must contain a list of strings")
+                logger.info(f"Loaded {len(tickers)} tickers from tickers.json")
                 return tickers
             except Exception as e:
-                logger.error(f"Error loading tickers.txt: {e}. Using default tickers.")
-        logger.info("tickers.txt not found. Using default tickers.")
+                logger.error(f"Error loading tickers.json: {e}. Using default tickers.")
+        logger.info("tickers.json not found. Using default tickers.")
         return ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META']
 
     def add_ticker(self, ticker: str):
