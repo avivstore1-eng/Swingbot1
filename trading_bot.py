@@ -47,19 +47,31 @@ class AdvancedSwingTradingBot:
     # ----------------- Ticker Management -----------------
     def load_tickers(self) -> List[str]:
         """Load tickers from tickers.json if exists, else use default."""
+        default_tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META']
         if os.path.exists('tickers.json'):
             try:
                 with open('tickers.json', 'r') as f:
-                    tickers = json.load(f)
-                if not isinstance(tickers, list) or not all(isinstance(t, str) for t in tickers):
-                    raise ValueError("tickers.json must contain a list of strings")
+                    data = json.load(f)
+                # Handle both array and {"tickers": [...]} formats
+                if isinstance(data, dict) and 'tickers' in data:
+                    tickers = data['tickers']
+                elif isinstance(data, list):
+                    tickers = data
+                else:
+                    raise ValueError("tickers.json must contain a list or an object with 'tickers' key containing a list")
+                if not all(isinstance(t, str) for t in tickers):
+                    raise ValueError("All items in tickers.json must be strings")
+                if not tickers:
+                    raise ValueError("tickers.json is empty")
                 logger.info(f"Loaded {len(tickers)} tickers from tickers.json: {tickers[:5]}{'...' if len(tickers) > 5 else ''}")
                 return tickers
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON format in tickers.json: {e}. Using default tickers: {default_tickers}")
             except Exception as e:
-                logger.error(f"Error loading tickers.json: {e}. Using default tickers.")
+                logger.error(f"Error loading tickers.json: {e}. Using default tickers: {default_tickers}")
         else:
-            logger.warning("tickers.json not found in repository. Using default tickers: ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META']")
-        return ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META']
+            logger.warning(f"tickers.json not found in repository. Using default tickers: {default_tickers}")
+        return default_tickers
 
     def add_ticker(self, ticker: str):
         if ticker not in self.tickers:
@@ -77,7 +89,7 @@ class AdvancedSwingTradingBot:
             stock = yf.Ticker(ticker)
             data = stock.history(period=period, interval=interval)
             if data.empty or len(data) < 50:
-                logger.warning(f"Insufficient data for {ticker}")
+                logger.warning(f"Insufficient data for {ticker} (rows: {len(data)})")
                 return None
             return data
         except Exception as e:
@@ -151,7 +163,7 @@ class AdvancedSwingTradingBot:
     def get_news_sentiment(self, ticker: str) -> float:
         try:
             if not self.api_keys['news_api']:
-                logger.warning(f"News API key missing for {ticker}. Using neutral sentiment.")
+                logger.warning(f"News API key missing for {ticker}. Using neutral sentiment. Get a key from https://newsapi.org/")
                 return 0.0
             url = f"https://newsapi.org/v2/everything?q={ticker}&apiKey={self.api_keys['news_api']}"
             response = requests.get(url)
@@ -168,24 +180,31 @@ class AdvancedSwingTradingBot:
             return 0.0
 
     # ----------------- ML Features & Training -----------------
-    def prepare_ml_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        latest = df.iloc[-1]
-        features = {
-            'EMA_20_vs_50': latest['EMA_20'] / latest['EMA_50'] - 1,
-            'EMA_20_vs_200': latest['EMA_20'] / latest['EMA_200'] - 1,
-            'Price_vs_EMA20': latest['Price_vs_EMA20'],
-            'Price_vs_EMA50': latest['Price_vs_EMA50'],
-            'RSI': latest['RSI'],
-            'MACD_Hist': latest['MACD_Hist'],
-            'BB_Position': (latest['Close'] - latest['BB_Lower']) / (latest['BB_Upper'] - latest['BB_Lower']),
-            'Volume_Ratio': latest['Volume_Ratio'],
-            'ATR': latest['ATR'],
-            'ADX': latest['ADX'],
-            'Stochastic': latest['SlowK'],
-            'Price_Change_1d': df['Close'].iloc[-1] / df['Close'].iloc[-2] - 1 if len(df) > 1 else 0,
-            'Price_Change_5d': df['Close'].iloc[-1] / df['Close'].iloc[-6] - 1 if len(df) > 5 else 0
-        }
-        return pd.DataFrame([features])
+    def prepare_ml_features(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        try:
+            if len(df) < 6:
+                logger.warning(f"Insufficient data rows ({len(df)}) for ML features. Skipping.")
+                return None
+            latest = df.iloc[-1]
+            features = {
+                'EMA_20_vs_50': latest['EMA_20'] / latest['EMA_50'] - 1,
+                'EMA_20_vs_200': latest['EMA_20'] / latest['EMA_200'] - 1,
+                'Price_vs_EMA20': latest['Price_vs_EMA20'],
+                'Price_vs_EMA50': latest['Price_vs_EMA50'],
+                'RSI': latest['RSI'],
+                'MACD_Hist': latest['MACD_Hist'],
+                'BB_Position': (latest['Close'] - latest['BB_Lower']) / (latest['BB_Upper'] - latest['BB_Lower']),
+                'Volume_Ratio': latest['Volume_Ratio'],
+                'ATR': latest['ATR'],
+                'ADX': latest['ADX'],
+                'Stochastic': latest['SlowK'],
+                'Price_Change_1d': df['Close'].iloc[-1] / df['Close'].iloc[-2] - 1 if len(df) > 1 else 0,
+                'Price_Change_5d': df['Close'].iloc[-1] / df['Close'].iloc[-6] - 1 if len(df) > 5 else 0
+            }
+            return pd.DataFrame([features])
+        except Exception as e:
+            logger.error(f"Error preparing ML features: {e}")
+            return None
 
     def prepare_ml_data(self, df: pd.DataFrame):
         features_df = pd.DataFrame()
@@ -211,7 +230,7 @@ class AdvancedSwingTradingBot:
             features_df = pd.concat([features_df, pd.DataFrame([features])], ignore_index=True)
             future_close = df['Close'].iloc[i + 5]
             targets.append(1 if future_close > latest['Close'] else 0)
-        return features_df, pd.Series(targets)
+        return features_df, pd.Series(targets, dtype='int64')
 
     def train_ml_model_all_tickers(self):
         all_features = pd.DataFrame()
@@ -249,6 +268,8 @@ class AdvancedSwingTradingBot:
             return "HOLD"
         try:
             features = self.prepare_ml_features(df)
+            if features is None:
+                return "HOLD"
             features_scaled = self.scaler.transform(features)
             pred = self.model.predict(features_scaled)[0]
             return "BUY" if pred == 1 else "SELL"
@@ -307,7 +328,7 @@ class AdvancedSwingTradingBot:
             token = self.api_keys['telegram_bot']
             chat_id = self.api_keys['telegram_chat_id']
             if not token or not chat_id:
-                logger.warning("Telegram keys missing. Skipping message.")
+                logger.warning("Telegram keys missing. Skipping message. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in GitHub Secrets.")
                 return
             url = f"https://api.telegram.org/bot{token}/sendMessage"
             payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
