@@ -53,11 +53,12 @@ class AdvancedSwingTradingBot:
                     tickers = json.load(f)
                 if not isinstance(tickers, list) or not all(isinstance(t, str) for t in tickers):
                     raise ValueError("tickers.json must contain a list of strings")
-                logger.info(f"Loaded {len(tickers)} tickers from tickers.json")
+                logger.info(f"Loaded {len(tickers)} tickers from tickers.json: {tickers[:5]}{'...' if len(tickers) > 5 else ''}")
                 return tickers
             except Exception as e:
                 logger.error(f"Error loading tickers.json: {e}. Using default tickers.")
-        logger.info("tickers.json not found. Using default tickers.")
+        else:
+            logger.warning("tickers.json not found in repository. Using default tickers: ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META']")
         return ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META']
 
     def add_ticker(self, ticker: str):
@@ -214,15 +215,18 @@ class AdvancedSwingTradingBot:
 
     def train_ml_model_all_tickers(self):
         all_features = pd.DataFrame()
-        all_targets = pd.Series()
+        all_targets = pd.Series(dtype='int64')
         for ticker in self.tickers:
             df = self.fetch_stock_data(ticker)
             if df is None:
                 continue
             df = self.calculate_advanced_indicators(df)
             features, targets = self.prepare_ml_data(df)
-            all_features = pd.concat([all_features, features], ignore_index=True)
-            all_targets = pd.concat([all_targets, targets], ignore_index=True)
+            if not features.empty and not targets.empty:
+                all_features = pd.concat([all_features, features], ignore_index=True)
+                all_targets = pd.concat([all_targets, targets], ignore_index=True)
+            else:
+                logger.warning(f"No valid ML data for {ticker}. Skipping.")
         if all_features.empty or len(all_targets) < 10:
             logger.warning("Insufficient data for ML training. Skipping.")
             return
@@ -383,7 +387,12 @@ class AdvancedSwingTradingBot:
             while True:
                 tz = pytz.timezone('Asia/Jerusalem')
                 now = datetime.now(tz)
-                if now.weekday() in [0, 1, 2, 3, 4] and 15 <= now.hour <= 23:
+                # Check if running manually (GITHUB_EVENT_NAME is set by GitHub Actions)
+                is_manual_run = os.getenv('GITHUB_EVENT_NAME') == 'workflow_dispatch'
+                if is_manual_run:
+                    logger.info(f"Manual run triggered at {now}. Running bot immediately...")
+                    self.run_once()
+                elif now.weekday() in [0, 1, 2, 3, 4] and 15 <= now.hour <= 23:
                     logger.info(f"Trading hours: {now}. Running bot...")
                     self.run_once()
                 else:
