@@ -2,7 +2,7 @@ name: Run Trading Bot
 
 on:
   schedule:
-    - cron: '30 * * * *'  # Every hour, every day
+    - cron: '30 */2 * * *'  # Every 2 hours, every day
   workflow_dispatch:
 
 jobs:
@@ -21,18 +21,23 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pandas numpy yfinance requests scikit-learn matplotlib xgboost
+          python -c "import xgboost; print('xgboost installed:', xgboost.__version__)"
+        continue-on-error: false
 
       - name: Run trading bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python trading_bot.py
+        timeout-minutes: 10
 
       - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: trading-bot-output
           path: |
             *.csv
             *.png
+            *.pkl
             trading_bot.log
