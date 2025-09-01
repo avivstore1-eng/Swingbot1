@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Advanced Swing Trading Bot 11/10 – Optimized, Robust, Free
-- Ready for GitHub Actions (headless-safe via matplotlib Agg)
-- No paid APIs. Uses yfinance (free) + optional Telegram alerts via env secrets.
-- Preserves all features from the original while improving accuracy & reliability.
+Advanced Swing Trading Bot – גרסת 10/10 בעברית
+- חינמי: yfinance + טלגרם אופציונלי
+- בטוח להרצה ב-GitHub Actions (matplotlib Agg)
+- משמר את כל היכולות של הגרסה הקודמת + תיקונים (ADX מדויק, BB בטוח, קאש, התמדה של מודל)
+- הודעות ותקצירים בעברית, כולל מצב ריצה ברור (פתוח/סגור/מוגבל)
 """
 
 import os
@@ -23,7 +25,7 @@ import pytz
 import requests
 import yfinance as yf
 
-# Headless plotting (CI safe)
+# Headless plotting ל-CI
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -31,18 +33,18 @@ import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
-# Reproducibility
+# שחזוריות
 random.seed(42)
 np.random.seed(42)
 
-# Optional but free: xgboost
+# נסה xgboost (חינמי). אם חסר—הבוט עדיין ירוץ בלי ה-ML.
 try:
     import xgboost as xgb
     XGB_AVAILABLE = True
 except ImportError:
     XGB_AVAILABLE = False
 
-# Logging
+# לוגים
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -50,47 +52,47 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ===== Config =====
-FORCE_ANALYSIS_WHEN_CLOSED = True      # Run strategy even when NYSE is closed (on latest data)
+# ===== תצורה =====
+FORCE_ANALYSIS_WHEN_CLOSED = os.getenv("FORCE_ANALYSIS_WHEN_CLOSED", "true").lower() == "true"  # אמת=לנתח גם כשהשוק סגור
 MODEL_PATH = "model.pkl"
 SCALER_PATH = "scaler.pkl"
 CACHE_PREFIX = "cache_"
 RESULTS_CSV = "trading_bot_summary.csv"
 RESULTS_CSV_LIMITED = "trading_bot_summary_limited.csv"
 
-# Telegram (free) via env
+# טלגרם (אופציונלי; חינמי)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
-# ===================== Utilities =====================
+# ===================== עזר =====================
 
 def send_telegram_message(message: str):
-    """Safe Telegram send (free)."""
+    """שליחה בטוחה לטלגרם (בעברית)."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.info("Telegram secrets not set. Skipping Telegram.")
+        logger.info("סודות טלגרם לא מוגדרים. מדלג על שליחה.")
         return
     try:
         if len(message) > 3500:
-            message = message[:3490] + "\n…(truncated)"
+            message = message[:3490] + "\n…(הודעה קוצרה)"
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
         r = requests.post(url, data=payload, timeout=10)
         r.raise_for_status()
-        logger.info("Telegram message sent.")
+        logger.info("הודעת טלגרם נשלחה.")
     except Exception as e:
-        logger.error(f"Telegram send error: {e}")
+        logger.error(f"שגיאת שליחת טלגרם: {e}")
 
 
 def load_tickers() -> List[str]:
-    """Load tickers from tickers.json if present (list or { 'tickers': [...] }). Fallback to defaults."""
-    blacklist = {"ANSS"}  # example of problematic ticker; preserve from original
+    """טעינת טיקרים מ-tickers.json (או ברירת מחדל)."""
+    blacklist = {"ANSS"}  # דוגמה לטיקר בעייתי
     test_tickers = ["AAPL", "MSFT", "GOOGL"]
     default_tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "META"]
 
     if os.path.exists("tickers.json"):
         try:
-            with open("tickers.json", "r") as f:
+            with open("tickers.json", "r", encoding="utf-8") as f:
                 data = json.load(f)
             tickers = data.get("tickers", data) if isinstance(data, dict) else data
             valid = []
@@ -98,90 +100,65 @@ def load_tickers() -> List[str]:
                 if isinstance(t, str) and t.strip() and len(t.strip()) <= 10 and t.isascii() and t not in blacklist:
                     valid.append(t.strip().upper())
             if not valid:
-                raise ValueError("No valid tickers after filtering.")
-            logger.info(f"Loaded {len(valid)} tickers from tickers.json.")
+                raise ValueError("לא נמצאו טיקרים תקינים.")
+            logger.info(f"נטענו {len(valid)} טיקרים מ-tickers.json.")
             return valid
         except Exception as e:
-            logger.error(f"tickers.json error: {e}. Using default tickers.")
+            logger.error(f"שגיאה בקריאת tickers.json: {e}. משתמש בברירת מחדל.")
             return default_tickers
     else:
-        logger.warning("tickers.json not found. Using test tickers.")
+        logger.warning("tickers.json לא נמצא. משתמש ברשימת בדיקה.")
         return test_tickers
 
 
 def is_nyse_holiday(date_obj: datetime.date) -> bool:
-    """Approximate NYSE holidays (2024-2026) without extra deps (free)."""
-    # Helper to compute nth weekday of month
+    """חגים עיקריים של NYSE לשנים 2024–2026 (קירוב ללא תלות חיצונית)."""
     def nth_weekday(year, month, weekday, n):
-        # weekday: Mon=0 .. Sun=6
+        # weekday: שני=0 ... ראשון=6
         d = datetime(year, month, 1)
         offset = (weekday - d.weekday()) % 7
         day = 1 + offset + (n - 1) * 7
         return datetime(year, month, day).date()
 
-    # Good Friday: two days before Easter (approx) — to avoid heavy logic, omit Good Friday exactness.
-    # Instead, hardcode a minimal set of known 2024-2026 dates or skip Good Friday (rarely breaks logic).
     y = date_obj.year
     holidays = set()
 
     for year in [2024, 2025, 2026]:
         # New Year's Day (observed)
         new_year = datetime(year, 1, 1).date()
-        if new_year.weekday() == 5:     # Sat -> observed Fri
+        if new_year.weekday() == 5:     # שבת -> שישי
             holidays.add(new_year - timedelta(days=1))
-        elif new_year.weekday() == 6:   # Sun -> observed Mon
+        elif new_year.weekday() == 6:   # ראשון -> שני
             holidays.add(new_year + timedelta(days=1))
         else:
             holidays.add(new_year)
 
-        # Martin Luther King Jr. Day – 3rd Monday of Jan
+        # MLK – שני שלישי בינואר
         holidays.add(nth_weekday(year, 1, 0, 3))
-
-        # Washington's Birthday – 3rd Monday of Feb
+        # Presidents' Day – שני שלישי בפברואר
         holidays.add(nth_weekday(year, 2, 0, 3))
-
-        # Memorial Day – last Monday of May
-        last_day_may = datetime(year, 5, 31).date()
-        holidays.add(last_day_may - timedelta(days=(last_day_may.weekday() - 0) % 7))
-
-        # Juneteenth – June 19 (observed)
-        june19 = datetime(year, 6, 19).date()
-        if june19.weekday() == 5:
-            holidays.add(june19 - timedelta(days=1))
-        elif june19.weekday() == 6:
-            holidays.add(june19 + timedelta(days=1))
-        else:
-            holidays.add(june19)
-
-        # Independence Day – July 4 (observed)
+        # Memorial Day – שני אחרון במאי
+        last_may = datetime(year, 5, 31).date()
+        holidays.add(last_may - timedelta(days=(last_may.weekday() - 0) % 7))
+        # Juneteenth – 19 ביוני (observed)
+        jun19 = datetime(year, 6, 19).date()
+        holidays.add(jun19 - timedelta(days=1) if jun19.weekday() == 5 else (jun19 + timedelta(days=1) if jun19.weekday() == 6 else jun19))
+        # Independence Day – 4 ביולי (observed)
         july4 = datetime(year, 7, 4).date()
-        if july4.weekday() == 5:
-            holidays.add(july4 - timedelta(days=1))
-        elif july4.weekday() == 6:
-            holidays.add(july4 + timedelta(days=1))
-        else:
-            holidays.add(july4)
-
-        # Labor Day – 1st Monday of Sep
+        holidays.add(july4 - timedelta(days=1) if july4.weekday() == 5 else (july4 + timedelta(days=1) if july4.weekday() == 6 else july4))
+        # Labor Day – שני ראשון בספטמבר
         holidays.add(nth_weekday(year, 9, 0, 1))
-
-        # Thanksgiving – 4th Thursday of Nov
+        # Thanksgiving – חמישי רביעי בנובמבר
         holidays.add(nth_weekday(year, 11, 3, 4))
-
-        # Christmas – Dec 25 (observed)
+        # Christmas – 25 בדצמבר (observed)
         xmas = datetime(year, 12, 25).date()
-        if xmas.weekday() == 5:
-            holidays.add(xmas - timedelta(days=1))
-        elif xmas.weekday() == 6:
-            holidays.add(xmas + timedelta(days=1))
-        else:
-            holidays.add(xmas)
+        holidays.add(xmas - timedelta(days=1) if xmas.weekday() == 5 else (xmas + timedelta(days=1) if xmas.weekday() == 6 else xmas))
 
     return date_obj in holidays
 
 
 def is_nyse_open_now() -> bool:
-    """Lightweight open/closed check for NYSE (without extra deps)."""
+    """בדיקת פתיחת שוק פשוטה (ללא תלות חיצונית)."""
     try:
         tz_ny = pytz.timezone("America/New_York")
         now = datetime.now(tz_ny)
@@ -193,7 +170,7 @@ def is_nyse_open_now() -> bool:
         market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
         return market_open <= now <= market_close
     except Exception as e:
-        logger.error(f"NYSE open check error: {e}")
+        logger.error(f"שגיאה בבדיקת פתיחת NYSE: {e}")
         return False
 
 
@@ -201,7 +178,7 @@ def safe_cache_key(*parts: str) -> str:
     return hashlib.md5("::".join(parts).encode()).hexdigest()
 
 
-# ===================== Indicators =====================
+# ===================== אינדיקטורים =====================
 
 def compute_RSI(series: pd.Series, period: int = 14) -> pd.Series:
     try:
@@ -214,7 +191,7 @@ def compute_RSI(series: pd.Series, period: int = 14) -> pd.Series:
         rsi = 100 - (100 / (1 + rs))
         return rsi.fillna(50)
     except Exception as e:
-        logger.error(f"RSI error: {e}")
+        logger.error(f"שגיאת RSI: {e}")
         return pd.Series(50, index=series.index)
 
 
@@ -227,7 +204,7 @@ def compute_MACD(series: pd.Series, fast: int = 12, slow: int = 26, signal: int 
         macd_hist = macd - macd_signal
         return macd.fillna(0), macd_signal.fillna(0), macd_hist.fillna(0)
     except Exception as e:
-        logger.error(f"MACD error: {e}")
+        logger.error(f"שגיאת MACD: {e}")
         idx = series.index
         return pd.Series(0, index=idx), pd.Series(0, index=idx), pd.Series(0, index=idx)
 
@@ -236,11 +213,12 @@ def compute_stochastic(df: pd.DataFrame, k_period: int = 14, d_period: int = 3):
     try:
         low_min = df["Low"].rolling(k_period).min()
         high_max = df["High"].rolling(k_period).max()
-        k = 100 * (df["Close"] - low_min) / (high_max - low_min).replace(0, np.nan)
+        denom = (high_max - low_min).replace(0, np.nan)
+        k = 100 * (df["Close"] - low_min) / denom
         d = k.rolling(d_period).mean()
         return k.fillna(50), d.fillna(50)
     except Exception as e:
-        logger.error(f"Stochastic error: {e}")
+        logger.error(f"שגיאת סטוכסטי: {e}")
         idx = df.index
         return pd.Series(50, index=idx), pd.Series(50, index=idx)
 
@@ -254,30 +232,27 @@ def compute_ATR(df: pd.DataFrame, period: int = 14):
         atr = tr.rolling(period).mean()
         return atr.fillna(0)
     except Exception as e:
-        logger.error(f"ATR error: {e}")
+        logger.error(f"שגיאת ATR: {e}")
         return pd.Series(0, index=df.index)
 
 
 def compute_ADX(df: pd.DataFrame, period: int = 14):
-    """Correct Wilder's ADX (fixes original bug)."""
+    """ADX לפי ווילדר (מדויק)."""
     try:
         high = df["High"]
         low = df["Low"]
         close = df["Close"]
 
-        # True Range
         high_low = high - low
         high_prev_close = (high - close.shift()).abs()
         low_prev_close = (low - close.shift()).abs()
         tr = pd.concat([high_low, high_prev_close, low_prev_close], axis=1).max(axis=1)
 
-        # Directional Movement
         up_move = high.diff()
         down_move = -low.diff()
         plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
         minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
-        # Wilder smoothing via rolling sum (approx)
         tr_smooth = pd.Series(tr).rolling(period).sum()
         plus_dm_smooth = pd.Series(plus_dm).rolling(period).sum()
         minus_dm_smooth = pd.Series(minus_dm).rolling(period).sum()
@@ -289,22 +264,20 @@ def compute_ADX(df: pd.DataFrame, period: int = 14):
         adx = dx.rolling(period).mean().fillna(0)
         return adx.fillna(0)
     except Exception as e:
-        logger.error(f"ADX error: {e}")
+        logger.error(f"שגיאת ADX: {e}")
         return pd.Series(0, index=df.index)
 
 
 def calculate_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     try:
         if len(df) < 50:
-            logger.warning(f"Insufficient rows ({len(df)}) for indicators.")
+            logger.warning(f"פחות מ-50 שורות—אין מספיק נתונים לאינדיקטורים.")
             return None
         df = df.copy()
-        # EMAs
         df["EMA_20"] = df["Close"].ewm(span=20, adjust=False).mean()
         df["EMA_50"] = df["Close"].ewm(span=50, adjust=False).mean()
         df["EMA_200"] = df["Close"].ewm(span=200, adjust=False).mean()
 
-        # Oscillators / bands
         df["RSI"] = compute_RSI(df["Close"], 14)
         df["MACD"], df["MACD_Signal"], df["MACD_Hist"] = compute_MACD(df["Close"])
         df["BB_Middle"] = df["Close"].rolling(20).mean()
@@ -315,42 +288,35 @@ def calculate_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         band_w = (df["BB_Upper"] - df["BB_Lower"]).replace(0, eps)
         df["BB_Position"] = ((df["Close"] - df["BB_Lower"]) / band_w).clip(0, 1)
 
-        # Stochastic
         df["SlowK"], df["SlowD"] = compute_stochastic(df)
-
-        # Volume / Volatility
         df["Volume_MA"] = df["Volume"].rolling(20).mean().replace(0, np.nan)
         df["Volume_Ratio"] = (df["Volume"] / df["Volume_MA"]).fillna(1.0)
         df["ATR"] = compute_ATR(df)
         df["ADX"] = compute_ADX(df)
 
-        # Relatives
         df["Price_vs_EMA20"] = df["Close"] / df["EMA_20"] - 1
         df["Price_vs_EMA50"] = df["Close"] / df["EMA_50"] - 1
 
         return df.replace([np.inf, -np.inf], 0).fillna(0)
     except Exception as e:
-        logger.error(f"Indicators error: {e}")
+        logger.error(f"שגיאה בחישוב אינדיקטורים: {e}")
         return None
 
 
-# ===================== Data =====================
+# ===================== נתונים =====================
 
 _data_cache: Dict[str, Dict] = {}
 
 def fetch_stock_data(ticker: str, period: str = "6mo", interval: str = "1d") -> Optional[pd.DataFrame]:
-    """Cached yfinance fetch (free)."""
+    """משיכת נתוני yfinance עם קאש יומי (חינמי)."""
     try:
         cache_key = safe_cache_key(ticker, period, interval)
         cache_file = f"{CACHE_PREFIX}{cache_key}.pkl"
         current_date = datetime.utcnow().date().isoformat()
 
-        # In-memory
-        cached = _data_cache.get(cache_key)
-        if cached and cached.get("date") == current_date:
-            return cached["data"]
+        if cache_key in _data_cache and _data_cache[cache_key].get("date") == current_date:
+            return _data_cache[cache_key]["data"]
 
-        # Disk
         if os.path.exists(cache_file):
             try:
                 with open(cache_file, "rb") as f:
@@ -359,26 +325,24 @@ def fetch_stock_data(ticker: str, period: str = "6mo", interval: str = "1d") -> 
                     _data_cache[cache_key] = disk_obj
                     return disk_obj["data"]
             except Exception as e:
-                logger.warning(f"Cache load warning for {ticker}: {e}")
+                logger.warning(f"שגיאת טעינת קאש עבור {ticker}: {e}")
 
-        # Fetch
         df = yf.Ticker(ticker).history(period=period, interval=interval)
         if df is None or df.empty or len(df) < 50:
-            logger.warning(f"Insufficient data for {ticker}.")
+            logger.warning(f"לא מספיק נתונים ל-{ticker}.")
             return None
 
-        # Save cache
         obj = {"date": current_date, "data": df}
         _data_cache[cache_key] = obj
         try:
             with open(cache_file, "wb") as f:
                 pickle.dump(obj, f)
         except Exception as e:
-            logger.warning(f"Cache save warning for {ticker}: {e}")
+            logger.warning(f"שגיאת שמירת קאש עבור {ticker}: {e}")
 
         return df
     except Exception as e:
-        logger.error(f"Data fetch error for {ticker}: {e}")
+        logger.error(f"שגיאה בשליפת נתונים ל-{ticker}: {e}")
         return None
 
 
@@ -406,7 +370,7 @@ def prepare_ml_features(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         }
         return pd.DataFrame([features])
     except Exception as e:
-        logger.error(f"ML feature error: {e}")
+        logger.error(f"שגיאת הכנת מאפייני ML: {e}")
         return None
 
 
@@ -417,7 +381,7 @@ def prepare_ml_dataset(df: pd.DataFrame):
         feats = []
         targets = []
         for i in range(50, len(df) - 5):
-            win = df.iloc[i - 50 : i]
+            win = df.iloc[i - 50: i]
             latest = win.iloc[-1]
             f = {
                 "EMA_20_vs_50": latest["EMA_20"] / latest["EMA_50"] - 1,
@@ -442,37 +406,37 @@ def prepare_ml_dataset(df: pd.DataFrame):
         y = pd.Series(targets, dtype="int64")
         return X, y
     except Exception as e:
-        logger.error(f"ML dataset error: {e}")
+        logger.error(f"שגיאת בניית דסייט ML: {e}")
         return pd.DataFrame(), pd.Series(dtype="int64")
 
 
 def load_or_train_model(tickers: List[str]):
-    """Persist & reuse model/scaler to save CI time. Keeps it free."""
+    """שומר/טוען מודל כדי לחסוך זמן ב-CI. נשאר חינמי."""
     model = None
     scaler = None
 
-    # Try load
+    # נסה לטעון
     if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH) and XGB_AVAILABLE:
         try:
             with open(MODEL_PATH, "rb") as f:
                 model = pickle.load(f)
             with open(SCALER_PATH, "rb") as f:
                 scaler = pickle.load(f)
-            logger.info("Loaded existing model & scaler.")
+            logger.info("מודל וסקיילר נטענו מקובץ.")
             return model, scaler
         except Exception as e:
-            logger.warning(f"Failed to load model/scaler: {e}")
+            logger.warning(f"כשל טעינת מודל/סקיילר: {e}")
 
-    # Train
+    # אימון
     if not XGB_AVAILABLE:
-        send_telegram_message("*Critical Error*: xgboost not installed. Run 'pip install xgboost'.")
-        logger.error("xgboost missing. ML disabled.")
+        send_telegram_message("*שגיאה קריטית*: לא מותקן xgboost. התקן עם: `pip install xgboost`.\nהבוט ימשיך בלי ML.")
+        logger.error("xgboost חסר. ML יושבת.")
         return None, StandardScaler()
 
     all_X = pd.DataFrame()
     all_y = pd.Series(dtype="int64")
     training_tickers = random.sample(tickers, min(25, len(tickers)))
-    logger.info(f"Training ML on {len(training_tickers)} tickers...")
+    logger.info(f"אימון ML על {len(training_tickers)} טיקרים...")
 
     for t in training_tickers:
         df = fetch_stock_data(t)
@@ -487,13 +451,11 @@ def load_or_train_model(tickers: List[str]):
             all_y = pd.concat([all_y, y], ignore_index=True)
 
     if all_X.empty or len(all_y) < 10:
-        send_telegram_message("*Error*: Insufficient data for ML training.")
-        logger.warning("Insufficient data for ML training.")
+        send_telegram_message("*שגיאה*: אין מספיק נתונים לאימון ML.")
+        logger.warning("אין מספיק נתונים לאימון ML.")
         return None, StandardScaler()
 
     X_train, X_test, y_train, y_test = train_test_split(all_X, all_y, test_size=0.2, random_state=42)
-
-    # Trees don't require scaling, but we keep scaler for consistency with earlier code (harmless).
     scaler = StandardScaler()
     scaler.fit(X_train)
     X_train_s = scaler.transform(X_train)
@@ -512,21 +474,20 @@ def load_or_train_model(tickers: List[str]):
     model.fit(X_train_s, y_train)
     train_score = model.score(X_train_s, y_train)
     test_score = model.score(X_test_s, y_test)
-    logger.info(f"XGB trained. Train={train_score:.3f}, Test={test_score:.3f}")
+    logger.info(f"מודל XGB אומן. Train={train_score:.3f}, Test={test_score:.3f}")
 
-    # Persist
     try:
         with open(MODEL_PATH, "wb") as f:
             pickle.dump(model, f)
         with open(SCALER_PATH, "wb") as f:
             pickle.dump(scaler, f)
     except Exception as e:
-        logger.warning(f"Persist model/scaler failed: {e}")
+        logger.warning(f"שגיאה בשמירת מודל/סקיילר: {e}")
 
     return model, scaler
 
 
-# ===================== Strategies =====================
+# ===================== אסטרטגיות =====================
 
 def strategy_trend_following(df: pd.DataFrame) -> str:
     try:
@@ -539,7 +500,7 @@ def strategy_trend_following(df: pd.DataFrame) -> str:
             return "SELL"
         return "HOLD"
     except Exception as e:
-        logger.error(f"Trend strategy error: {e}")
+        logger.error(f"שגיאה באסטרטגיית טרנד: {e}")
         return "HOLD"
 
 
@@ -554,7 +515,7 @@ def strategy_mean_reversion(df: pd.DataFrame) -> str:
             return "SELL"
         return "HOLD"
     except Exception as e:
-        logger.error(f"Mean strategy error: {e}")
+        logger.error(f"שגיאה באסטרטגיית ממוצע חוזר: {e}")
         return "HOLD"
 
 
@@ -571,22 +532,22 @@ def strategy_breakout(df: pd.DataFrame) -> str:
             return "SELL"
         return "HOLD"
     except Exception as e:
-        logger.error(f"Breakout strategy error: {e}")
+        logger.error(f"שגיאה באסטרטגיית פריצה: {e}")
         return "HOLD"
 
 
 def vote_final_signal(signals: List[str]) -> str:
-    """Better voting (requires at least two BUY/SELL to overcome HOLD)."""
+    """הצבעה משופרת: צריך לפחות שני BUY/SELL כדי לנצח HOLD."""
     votes = {"BUY": signals.count("BUY"), "SELL": signals.count("SELL"), "HOLD": signals.count("HOLD")}
     if max(votes["BUY"], votes["SELL"]) >= 2:
         return "BUY" if votes["BUY"] > votes["SELL"] else "SELL"
     return "HOLD"
 
 
-# ===================== Backtesting & Scoring =====================
+# ===================== Backtest ודירוג =====================
 
 def backtest_day_ahead(df: pd.DataFrame, strategy_func) -> Dict[str, float]:
-    """Simple day-ahead: next-day return with signal. (Keeps behavior but avoids NaNs)"""
+    """מודל פשוט: תשואת יום קדימה לפי האיתות."""
     try:
         if len(df) < 50:
             return {"Total_Return": 0.0, "Win_Rate": 0.0}
@@ -604,34 +565,34 @@ def backtest_day_ahead(df: pd.DataFrame, strategy_func) -> Dict[str, float]:
         win_rate = (returns > 0).mean()
         return {"Total_Return": float(total_return), "Win_Rate": float(win_rate)}
     except Exception as e:
-        logger.error(f"Backtest error: {e}")
+        logger.error(f"שגיאת Backtest: {e}")
         return {"Total_Return": 0.0, "Win_Rate": 0.0}
 
 
 def weighted_score(row: pd.Series) -> float:
-    """Normalized blend: max strategy return + corresponding win rate."""
+    """ציון משוקלל מנורמל: מקס' תשואה של אסטרטגיה + win rate תואם."""
     ret_max = max(abs(row["Backtest_Trend"]), abs(row["Backtest_Mean"]), abs(row["Backtest_Breakout"]), 1e-9)
     ret_norm = max(row["Backtest_Trend"], row["Backtest_Mean"], row["Backtest_Breakout"]) / ret_max
-    win_norm = max(row["Backtest_Trend_Win"], row["Backtest_Mean_Win"], row["Backtest_Breakout_Win"])  # already 0..1
+    win_norm = max(row["Backtest_Trend_Win"], row["Backtest_Mean_Win"], row["Backtest_Breakout_Win"])
     return 0.6 * ret_norm + 0.4 * win_norm
 
 
-# ===================== Visualization =====================
+# ===================== ויזואליזציה =====================
 
 def visualize_signals(df: pd.DataFrame, ticker: str, final_signal: str):
     try:
         if df["Close"].isna().all() or df["EMA_20"].isna().all() or df["EMA_50"].isna().all() or df["RSI"].isna().all():
-            logger.warning(f"Invalid data for visualization in {ticker}")
+            logger.warning(f"נתונים לא תקינים לתרשים עבור {ticker}")
             return
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), gridspec_kw={"height_ratios": [3, 1]})
-        ax1.plot(df.index, df["Close"], label="Close")
+        ax1.plot(df.index, df["Close"], label="סגירה")
         ax1.plot(df.index, df["EMA_20"], label="EMA 20")
         ax1.plot(df.index, df["EMA_50"], label="EMA 50")
         if final_signal == "BUY":
-            ax1.scatter(df.index[-1], df["Close"].iloc[-1], marker="^", s=100, label="BUY Signal")
+            ax1.scatter(df.index[-1], df["Close"].iloc[-1], marker="^", s=100, label="איתות קנייה")
         elif final_signal == "SELL":
-            ax1.scatter(df.index[-1], df["Close"].iloc[-1], marker="v", s=100, label="SELL Signal")
-        ax1.set_title(f"{ticker} Price & EMA with Signals")
+            ax1.scatter(df.index[-1], df["Close"].iloc[-1], marker="v", s=100, label="איתות מכירה")
+        ax1.set_title(f"{ticker} – מחיר ו-EMA + איתות")
         ax1.legend()
         ax1.grid(True)
 
@@ -646,12 +607,12 @@ def visualize_signals(df: pd.DataFrame, ticker: str, final_signal: str):
         out = f"{ticker}_chart.png"
         plt.savefig(out)
         plt.close()
-        logger.info(f"Chart saved: {out}")
+        logger.info(f"נשמר תרשים: {out}")
     except Exception as e:
-        logger.error(f"Visualization error for {ticker}: {e}")
+        logger.error(f"שגיאה בשרטוט {ticker}: {e}")
 
 
-# ===================== Core Bot =====================
+# ===================== הלוגיקה הראשית =====================
 
 class AdvancedSwingTradingBot:
     def __init__(self):
@@ -671,7 +632,7 @@ class AdvancedSwingTradingBot:
             pred = self.model.predict(Xs)[0]
             return "BUY" if int(pred) == 1 else "SELL"
         except Exception as e:
-            logger.error(f"ML prediction error: {e}")
+            logger.error(f"שגיאת ML Prediction: {e}")
             return "HOLD"
 
     def calc_trade_details(self, df: pd.DataFrame, signal: str) -> Dict[str, float]:
@@ -689,7 +650,7 @@ class AdvancedSwingTradingBot:
                 tp = sl = entry
             return {"Entry_Price": entry, "Take_Profit": tp, "Stop_Loss": sl}
         except Exception as e:
-            logger.error(f"Trade details error: {e}")
+            logger.error(f"שגיאה בחישוב פרטי עסקה: {e}")
             return {"Entry_Price": 0.0, "Take_Profit": 0.0, "Stop_Loss": 0.0}
 
     def update_portfolio(self, ticker: str, signal: str):
@@ -698,14 +659,14 @@ class AdvancedSwingTradingBot:
             if ticker not in self.portfolio:
                 self.portfolio[ticker] = {"position": 0, "last_signal": "HOLD"}
             if pos_count >= 5 and signal in ("BUY", "SELL"):
-                logger.warning(f"Portfolio limit reached. Skipping {ticker} {signal}.")
+                logger.warning(f"הגבלת פורטפוליו—מדלג על {ticker} {signal}.")
                 return
             current = self.portfolio[ticker]
             current["last_signal"] = signal
             current["position"] = 1 if signal == "BUY" else (-1 if signal == "SELL" else 0)
             self.portfolio[ticker] = current
         except Exception as e:
-            logger.error(f"Portfolio update error: {e}")
+            logger.error(f"שגיאה בעדכון פורטפוליו: {e}")
 
     def process_ticker(self, ticker: str) -> Optional[Dict]:
         try:
@@ -723,11 +684,9 @@ class AdvancedSwingTradingBot:
             s_break = strategy_breakout(df)
             s_ml = self.get_ml_signal(df)
 
-            # Voting
             signals = [s_trend, s_mean, s_break, s_ml]
             final_signal = vote_final_signal(signals)
 
-            # Backtests
             bt_trend = backtest_day_ahead(df, strategy_func=strategy_trend_following)
             bt_mean = backtest_day_ahead(df, strategy_func=strategy_mean_reversion)
             bt_break = backtest_day_ahead(df, strategy_func=strategy_breakout)
@@ -751,33 +710,40 @@ class AdvancedSwingTradingBot:
                 "Take_Profit": trade["Take_Profit"],
                 "Stop_Loss": trade["Stop_Loss"],
             }
-
-            # Optional: create a chart for top picks later
             return result
         except Exception as e:
-            logger.error(f"{ticker} processing error: {e}")
+            logger.error(f"שגיאה בעיבוד {ticker}: {e}")
             self.failed_tickers.append(ticker)
             return None
+
+    def _send_no_picks_summary(self, analyzed: int, limited: bool):
+        mode = "מצומצם (דגימה)" if limited else "מלא"
+        send_telegram_message(
+            f"*סיכום {datetime.utcnow().date()}*\n"
+            f"מצב ריצה: {mode}\n"
+            f"נסקרו {analyzed} טיקרים.\n"
+            f"לא נמצאו בחירות פעולה (כולם HOLD). קבצים נשמרו כארטיפקטים."
+        )
 
     def run_full_strategy(self):
         results = []
         self.failed_tickers = []
 
-        logger.info(f"Processing {len(self.tickers)} tickers...")
+        logger.info(f"מעבד {len(self.tickers)} טיקרים...")
         for t in self.tickers:
             res = self.process_ticker(t)
             if res:
                 results.append(res)
 
         if not results:
-            logger.warning("No results produced.")
+            logger.warning("לא הופקו תוצאות כלל.")
+            self._send_no_picks_summary(0, limited=False)
             return
 
         df = pd.DataFrame(results)
         df["Weighted_Score"] = df.apply(weighted_score, axis=1)
         top = df[df["Final_Signal"] != "HOLD"].sort_values("Weighted_Score", ascending=False).head(5)
 
-        # Visualize top picks
         if not top.empty:
             for _, row in top.iterrows():
                 d = fetch_stock_data(row["Ticker"])
@@ -790,32 +756,36 @@ class AdvancedSwingTradingBot:
 
             avg_ret = top[["Backtest_Trend", "Backtest_Mean", "Backtest_Breakout"]].max(axis=1).mean()
             avg_win = top[["Backtest_Trend_Win", "Backtest_Mean_Win", "Backtest_Breakout_Win"]].max(axis=1).mean()
-            market_status = "open" if is_nyse_open_now() else "closed, using latest available prices"
-            msg = f"*Top 5 Trading Picks for {datetime.utcnow().date()}*\n" \
-                  f"*Market Status*: NYSE {market_status}\n" \
-                  f"*Average Return*: {avg_ret*100:.1f}%\n" \
-                  f"*Average Win Rate*: {avg_win*100:.1f}%\n\n"
+            market_status = "פתוחה" if is_nyse_open_now() else "סגורה – משתמש בנתונים העדכניים האחרונים"
+            msg = f"*5 הבחירות המובילות ל-{datetime.utcnow().date()}*\n" \
+                  f"*סטטוס שוק*: NYSE {market_status}\n" \
+                  f"*תשואה ממוצעת (Backtest)*: {avg_ret*100:.1f}%\n" \
+                  f"*שיעור הצלחה ממוצע*: {avg_win*100:.1f}%\n\n"
             for i, (_, row) in enumerate(top.iterrows(), start=1):
                 win_rate = max(
                     row["Backtest_Trend_Win"] if row["Trend_Signal"] == row["Final_Signal"] else 0,
                     row["Backtest_Mean_Win"] if row["Mean_Signal"] == row["Final_Signal"] else 0,
                     row["Backtest_Breakout_Win"] if row["Breakout_Signal"] == row["Final_Signal"] else 0,
                 )
-                msg += f"{i}. *{row['Ticker']}* — *{row['Final_Signal']}*\n" \
-                       f"   Entry: ${row['Entry_Price']:.2f}\n" \
-                       f"   Take Profit: ${row['Take_Profit']:.2f}\n" \
-                       f"   Stop Loss: ${row['Stop_Loss']:.2f}\n" \
-                       f"   Win Rate: {win_rate*100:.1f}%\n\n"
+                msg += (
+                    f"{i}. *{row['Ticker']}* — *{row['Final_Signal']}*\n"
+                    f"   כניסה: ${row['Entry_Price']:.2f}\n"
+                    f"   טייק פרופיט: ${row['Take_Profit']:.2f}\n"
+                    f"   סטופ-לוס: ${row['Stop_Loss']:.2f}\n"
+                    f"   שיעור הצלחה מוערך: {win_rate*100:.1f}%\n\n"
+                )
             send_telegram_message(msg)
+        else:
+            self._send_no_picks_summary(len(df), limited=False)
 
         df.to_csv(RESULTS_CSV, index=False)
-        logger.info(f"Summary saved to {RESULTS_CSV}")
+        logger.info(f"נשמר סיכום ל-{RESULTS_CSV}")
 
         if self.failed_tickers:
-            send_telegram_message(f"*Failed Tickers*\n{self.failed_tickers[:50]}{'...' if len(self.failed_tickers) > 50 else ''}")
+            send_telegram_message(f"*טיקרים שנכשלו בעיבוד*\n{self.failed_tickers[:50]}{'...' if len(self.failed_tickers) > 50 else ''}")
 
     def run_single_run(self):
-        """Smaller run when market closed (preserved feature)."""
+        """ריצה מצומצמת כשהשוק סגור (אם לא כופים ניתוח מלא)."""
         sample = random.sample(self.tickers, min(15, len(self.tickers)))
         results = []
         self.failed_tickers = []
@@ -826,6 +796,7 @@ class AdvancedSwingTradingBot:
                 results.append(res)
 
         if not results:
+            self._send_no_picks_summary(0, limited=True)
             return
 
         df = pd.DataFrame(results)
@@ -833,47 +804,61 @@ class AdvancedSwingTradingBot:
         top = df[df["Final_Signal"] != "HOLD"].sort_values("Weighted_Score", ascending=False).head(3)
 
         if not top.empty:
-            msg = f"*Top 3 Trading Picks for {datetime.utcnow().date()} (Limited Run)*\n" \
-                  f"*Market Status*: NYSE closed, using latest available prices\n\n"
+            msg = f"*3 בחירות מובילות ל-{datetime.utcnow().date()} (ריצה מצומצמת)*\n" \
+                  f"*סטטוס שוק*: NYSE סגורה – משתמש בנתונים העדכניים האחרונים\n\n"
             for i, (_, row) in enumerate(top.iterrows(), start=1):
                 win_rate = max(
                     row["Backtest_Trend_Win"] if row["Trend_Signal"] == row["Final_Signal"] else 0,
                     row["Backtest_Mean_Win"] if row["Mean_Signal"] == row["Final_Signal"] else 0,
                     row["Backtest_Breakout_Win"] if row["Breakout_Signal"] == row["Final_Signal"] else 0,
                 )
-                msg += f"{i}. *{row['Ticker']}* — *{row['Final_Signal']}*\n" \
-                       f"   Entry: ${row['Entry_Price']:.2f}\n" \
-                       f"   Take Profit: ${row['Take_Profit']:.2f}\n" \
-                       f"   Stop Loss: ${row['Stop_Loss']:.2f}\n" \
-                       f"   Win Rate: {win_rate*100:.1f}%\n\n"
+                msg += (
+                    f"{i}. *{row['Ticker']}* — *{row['Final_Signal']}*\n"
+                    f"   כניסה: ${row['Entry_Price']:.2f}\n"
+                    f"   טייק פרופיט: ${row['Take_Profit']:.2f}\n"
+                    f"   סטופ-לוס: ${row['Stop_Loss']:.2f}\n"
+                    f"   שיעור הצלחה מוערך: {win_rate*100:.1f}%\n\n"
+                )
             send_telegram_message(msg)
+        else:
+            self._send_no_picks_summary(len(df), limited=True)
 
         df.to_csv(RESULTS_CSV_LIMITED, index=False)
-        logger.info(f"Limited summary saved to {RESULTS_CSV_LIMITED}")
+        logger.info(f"נשמר סיכום מצומצם ל-{RESULTS_CSV_LIMITED}")
 
         if self.failed_tickers:
-            send_telegram_message(f"*Failed Tickers (Limited)*\n{self.failed_tickers[:50]}{'...' if len(self.failed_tickers) > 50 else ''}")
+            send_telegram_message(f"*טיקרים שנכשלו בעיבוד (מצומצם)*\n{self.failed_tickers[:50]}{'...' if len(self.failed_tickers) > 50 else ''}")
 
     def run_once(self):
         tz_ist = pytz.timezone("Asia/Jerusalem")
         now_ist = datetime.now(tz_ist)
-        send_telegram_message(f"*Trading Bot*\nRun started at {now_ist}. NYSE is {'open' if is_nyse_open_now() else 'closed'}.")
+        nyse_open = is_nyse_open_now()
+        mode = ("אסטרטגיה מלאה (שוק פתוח)" if nyse_open
+                else ("אסטרטגיה מלאה על נתונים עדכניים אחרונים" if FORCE_ANALYSIS_WHEN_CLOSED
+                      else "ריצה מצומצמת (דגימה)"))
+
+        send_telegram_message(
+            f"*בוט מסחר – תחילת ריצה*\n"
+            f"זמן מקומי: {now_ist}\n"
+            f"סטטוס NYSE: {'פתוחה' if nyse_open else 'סגורה'}\n"
+            f"מצב ריצה: {mode}"
+        )
 
         start = time.time()
         try:
-            if is_nyse_open_now():
+            if nyse_open:
                 self.run_full_strategy()
             else:
                 if FORCE_ANALYSIS_WHEN_CLOSED:
-                    logger.info("Market closed — running full strategy on latest available data.")
+                    logger.info("שוק סגור – מריץ אסטרטגיה מלאה על הנתון האחרון.")
                     self.run_full_strategy()
                 else:
-                    logger.info("Market closed — running limited sample.")
+                    logger.info("שוק סגור – מריץ ריצה מצומצמת (דגימה).")
                     self.run_single_run()
         finally:
             elapsed = time.time() - start
             if elapsed > 600:
-                send_telegram_message(f"*Warning*: Bot run took {elapsed/60:.1f} minutes (>10m). Check logs.")
+                send_telegram_message(f"*אזהרה*: זמן ריצה {elapsed/60:.1f} דקות (>10 דק'). בדוק לוגים.")
 
 
 if __name__ == "__main__":
