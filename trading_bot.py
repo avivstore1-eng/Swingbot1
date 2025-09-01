@@ -19,7 +19,7 @@ from sklearn.model_selection import train_test_split
 import pytz
 from multiprocessing import Pool, cpu_count
 import matplotlib.pyplot as plt
-import random  # Added import for random.sample
+import random  # Fix NameError: name 'random' is not defined
 import pickle
 import hashlib
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
@@ -38,7 +38,7 @@ except ImportError:
                 requests.post(url, data=payload, timeout=10)
             except:
                 pass
-    send_emergency_telegram("*Critical Error*: xgboost module not found. Please ensure xgboost is installed.")
+    send_emergency_telegram("*Critical Error*: xgboost module not found. Install with 'pip install xgboost'.")
     raise ImportError("xgboost module not found. Install with 'pip install xgboost'.")
 
 # Logging
@@ -48,6 +48,9 @@ logging.basicConfig(
     handlers=[logging.FileHandler('trading_bot.log'), logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
+
+# Configuration
+force_analysis_when_closed = True  # If True, run full strategy even when market is closed
 
 class AdvancedSwingTradingBot:
     def __init__(self):
@@ -166,7 +169,7 @@ class AdvancedSwingTradingBot:
             except Exception as e:
                 logger.error(f"Attempt {attempt+1}/3 failed for {ticker}: {e}")
                 if attempt < 2:
-                    time.sleep(5)  # Increased to 5s to avoid rate-limiting
+                    time.sleep(5)
                 else:
                     logger.error(f"All attempts failed for {ticker}")
                     return None
@@ -601,23 +604,9 @@ class AdvancedSwingTradingBot:
                 self.failed_tickers.append(ticker)
                 return None
 
-    # ----------------- Run Bot -----------------
-    def run_once(self):
-        tz_ist = pytz.timezone('Asia/Jerusalem')
-        now_ist = datetime.now(tz_ist)
-        is_manual_run = os.getenv('GITHUB_EVENT_NAME') == 'workflow_dispatch'
-        is_nyse_open = self.is_nyse_open()
-        market_status = "open" if is_nyse_open else "closed, using latest available prices"
-        start_time = time.time()
-        
-        logger.info(f"Starting Advanced Swing Trading Bot - Single Run (NYSE {market_status})")
-        self.send_telegram_message(
-            f"*Trading Bot*\nRun started at {now_ist}. NYSE is {market_status}."
-        )
-        self.failed_tickers = []
+    # ----------------- Full Strategy -----------------
+    def run_full_strategy(self):
         results = []
-        
-        # Parallel processing with limited processes
         num_processes = min(cpu_count(), 4)
         logger.info(f"Using {num_processes} processes for multiprocessing")
         with Pool(processes=num_processes) as pool:
@@ -643,6 +632,7 @@ class AdvancedSwingTradingBot:
                             self.visualize_signals(df, row['Ticker'], row['Final_Signal'])
                 avg_return = top_picks[['Backtest_Trend', 'Backtest_Mean', 'Backtest_Breakout']].max(axis=1).mean()
                 avg_win_rate = top_picks[['Backtest_Trend_Win', 'Backtest_Mean_Win', 'Backtest_Breakout_Win']].max(axis=1).mean()
+                market_status = "open" if self.is_nyse_open() else "closed, using latest available prices"
                 summary_message = (
                     f"*Top 5 Trading Picks for {datetime.now().date()}*\n"
                     f"*Market Status*: NYSE {market_status}\n"
@@ -668,6 +658,77 @@ class AdvancedSwingTradingBot:
         if self.failed_tickers:
             logger.info(f"Failed tickers during run: {self.failed_tickers}")
             self.send_telegram_message(f"*Failed Tickers*\n{self.failed_tickers[:50]}{'...' if len(self.failed_tickers) > 50 else ''}")
+        return results
+
+    # ----------------- Single Run with Latest Data -----------------
+    def run_single_run_with_latest_data(self):
+        results = []
+        sample_tickers = random.sample(self.tickers, min(50, len(self.tickers)))  # Process only 50 tickers
+        logger.info(f"Processing {len(sample_tickers)} tickers for single run")
+        for ticker in sample_tickers:
+            result = self.process_ticker_with_timeout(ticker)
+            if result is not None:
+                results.append(result)
+        
+        if results:
+            results_df = pd.DataFrame(results)
+            results_df['Weighted_Score'] = (
+                0.6 * results_df[['Backtest_Trend', 'Backtest_Mean', 'Backtest_Breakout']].max(axis=1) +
+                0.4 * results_df[['Backtest_Trend_Win', 'Backtest_Mean_Win', 'Backtest_Breakout_Win']].max(axis=1)
+            )
+            top_picks = results_df[results_df['Final_Signal'] != "HOLD"].sort_values(by='Weighted_Score', ascending=False).head(3)
+            if not top_picks.empty:
+                market_status = "closed, using latest available prices"
+                summary_message = (
+                    f"*Top 3 Trading Picks for {datetime.now().date()} (Limited Run)*\n"
+                    f"*Market Status*: NYSE {market_status}\n"
+                    f"*Note*: Limited analysis due to market closure\n\n"
+                )
+                for idx, row in top_picks.iterrows():
+                    win_rate = max(
+                        (row['Backtest_Trend_Win'] if row['Trend_Signal'] == row['Final_Signal'] else 0),
+                        (row['Backtest_Mean_Win'] if row['Mean_Signal'] == row['Final_Signal'] else 0),
+                        (row['Backtest_Breakout_Win'] if row['Breakout_Signal'] == row['Final_Signal'] else 0)
+                    )
+                    summary_message += (
+                        f"{idx + 1}. *{row['Ticker']}* - *{row['Final_Signal']}*\n"
+                        f"   Entry: ${row['Entry_Price']:.2f}\n"
+                        f"   Take Profit: ${row['Take_Profit']:.2f}\n"
+                        f"   Stop Loss: ${row['Stop_Loss']:.2f}\n"
+                        f"   Win Rate: {win_rate*100:.1f}%\n\n"
+                    )
+                self.send_telegram_message(summary_message)
+            results_df.to_csv('trading_bot_summary_limited.csv', index=False)
+            logger.info(f"Limited Run Summary saved to trading_bot_summary_limited.csv")
+        if self.failed_tickers:
+            logger.info(f"Failed tickers during limited run: {self.failed_tickers}")
+            self.send_telegram_message(f"*Failed Tickers (Limited Run)*\n{self.failed_tickers[:50]}{'...' if len(self.failed_tickers) > 50 else ''}")
+        return results
+
+    # ----------------- Run Bot -----------------
+    def run_once(self):
+        tz_ist = pytz.timezone('Asia/Jerusalem')
+        now_ist = datetime.now(tz_ist)
+        is_manual_run = os.getenv('GITHUB_EVENT_NAME') == 'workflow_dispatch'
+        start_time = time.time()
+        
+        logger.info(f"Starting Advanced Swing Trading Bot - Single Run")
+        self.send_telegram_message(
+            f"*Trading Bot*\nRun started at {now_ist}."
+        )
+        self.failed_tickers = []
+
+        if self.is_nyse_open():
+            logger.info("Market open – running full strategy")
+            self.run_full_strategy()
+        else:
+            if force_analysis_when_closed:
+                logger.info("Market closed – running full strategy on latest available data")
+                self.run_full_strategy()
+            else:
+                logger.info("Market closed – single run only")
+                self.run_single_run_with_latest_data()
+        
         elapsed_time = time.time() - start_time
         logger.info(f"Single run completed in {elapsed_time:.2f}s")
         if elapsed_time > 600:
