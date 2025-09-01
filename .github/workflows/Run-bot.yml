@@ -1,54 +1,75 @@
-name: Run Trading Bot
+name: Trading Bot
 
 on:
-  schedule:
-    - cron: '30 */2 * * *'  # Every 2 hours, every day
   workflow_dispatch:
+  push:
+    branches: [ "main" ]
+  # cron ב-UTC (דוגמה: 21:30 UTC בימי חול)
+  schedule:
+    - cron: "30 21 * * 1-5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trading-bot
+  cancel-in-progress: true
 
 jobs:
-  run-bot:
+  run:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pandas numpy yfinance requests scikit-learn matplotlib xgboost
-          python -c "import xgboost; print('xgboost installed:', xgboost.__version__)"
-        continue-on-error: false
+        run: pip install -r requirements.txt
+
+      - name: Show xgboost version
+        run: python - << 'PY'
+import xgboost as xgb
+print("xgboost installed:", xgb.__version__)
+PY
 
       - name: Run trading bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python trading_bot.py
-        timeout-minutes: 10
-
-      - name: Notify on failure
-        if: failure()
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EQUITY: "100000"
+          RISK_PER_TRADE: "0.01"
+          COOLDOWN_DAYS: "2"
+          MAX_WORKERS: "8"
+          MAX_EXPOSURE: "0.6"
         run: |
-          curl -s -X POST https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage \
-          -d chat_id=${TELEGRAM_CHAT_ID} \
-          -d text="*Trading Bot Failed*\nRun failed or timed out after 10 minutes. Check GitHub Actions logs." \
-          -d parse_mode=Markdown
+          python trading_bot.py
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: trading-bot-output
+          name: trading-bot-artifacts
           path: |
-            *.csv
-            *.png
-            *.pkl
             trading_bot.log
+            trading_bot_summary.csv
+            trading_bot_summary_limited.csv
+            monthly_backtest_report.csv
+            monthly_equity_curve.png
+            *_chart.png
+          if-no-files-found: ignore
