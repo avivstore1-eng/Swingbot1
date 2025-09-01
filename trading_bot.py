@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Advanced Swing Trading Bot 11/10 – Single Run, No Sentiment, Runs Anytime with Latest Prices
+Advanced Swing Trading Bot 11/10 – Optimized for Speed, Timeout Handling, Runs Anytime
 Free, GitHub Actions ready, no TA-Lib, no external APIs, JSON tickers
 """
 
@@ -16,10 +16,31 @@ import json
 from typing import Dict, List, Optional
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
-import xgboost as xgb
-import matplotlib.pyplot as plt
 import pytz
 from multiprocessing import Pool, cpu_count
+import matplotlib.pyplot as plt
+import random
+import pickle
+import hashlib
+from functools import wraps
+import signal
+
+# Check for xgboost and send Telegram alert if missing
+try:
+    import xgboost as xgb
+except ImportError:
+    def send_emergency_telegram(message: str):
+        token = os.getenv('TELEGRAM_BOT_TOKEN')
+        chat_id = os.getenv('TELEGRAM_CHAT_ID')
+        if token and chat_id:
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
+            try:
+                requests.post(url, data=payload, timeout=10)
+            except:
+                pass
+    send_emergency_telegram("*Critical Error*: xgboost module not found. Please ensure xgboost is installed.")
+    raise ImportError("xgboost module not found. Install with 'pip install xgboost'.")
 
 # Logging
 logging.basicConfig(
@@ -28,6 +49,23 @@ logging.basicConfig(
     handlers=[logging.FileHandler('trading_bot.log'), logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
+
+# Timeout decorator for ticker processing
+def timeout(seconds):
+    def decorator(func):
+        def _handle_timeout(signum, frame):
+            raise TimeoutError(f"Function {func.__name__} timed out after {seconds} seconds")
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            signal.signal(signal.SIGALRM, _handle_timeout)
+            signal.alarm(seconds)
+            try:
+                result = func(*args, **kwargs)
+            finally:
+                signal.alarm(0)
+            return result
+        return wrapper
+    return decorator
 
 class AdvancedSwingTradingBot:
     def __init__(self):
@@ -41,6 +79,7 @@ class AdvancedSwingTradingBot:
             'telegram_bot': os.getenv('TELEGRAM_BOT_TOKEN'),
             'telegram_chat_id': os.getenv('TELEGRAM_CHAT_ID')
         }
+        self.data_cache = {}
         logger.info("Bot initialized. Training ML model...")
         self.train_ml_model_all_tickers()
 
@@ -61,45 +100,77 @@ class AdvancedSwingTradingBot:
                     raise ValueError("All items in tickers.json must be strings")
                 if not tickers:
                     raise ValueError("tickers.json is empty")
-                logger.info(f"Loaded {len(tickers)} tickers from tickers.json: {tickers[:5]}{'...' if len(tickers) > 5 else ''}")
+                logger.info(f"Loaded {len(tickers)} tickers from tickers.json")
                 return tickers
             except json.JSONDecodeError as e:
-                logger.error(f"Invalid JSON format in tickers.json: {e}. Using default tickers: {default_tickers}")
+                logger.error(f"Invalid JSON format in tickers.json: {e}. Using default tickers")
             except Exception as e:
-                logger.error(f"Error loading tickers.json: {e}. Using default tickers: {default_tickers}")
+                logger.error(f"Error loading tickers.json: {e}. Using default tickers")
         else:
-            logger.warning(f"tickers.json not found. Using default tickers: {default_tickers}")
+            logger.warning(f"tickers.json not found. Using default tickers")
         return default_tickers
 
     # ----------------- Check NYSE Trading Hours -----------------
     def is_nyse_open(self) -> bool:
         tz_ny = pytz.timezone('America/New_York')
         now_ny = datetime.now(tz_ny)
-        
         if now_ny.weekday() >= 5:
             return False
-        
         market_open = now_ny.replace(hour=9, minute=30, second=0, microsecond=0)
         market_close = now_ny.replace(hour=16, minute=0, second=0, microsecond=0)
-        
         return market_open <= now_ny <= market_close
 
-    # ----------------- Fetch Data -----------------
-    def fetch_stock_data(self, ticker: str, period: str = '6mo', interval: str = '1d') -> Optional[pd.DataFrame]:
-        try:
-            stock = yf.Ticker(ticker)
-            data = stock.history(period=period, interval=interval)
-            if data.empty or len(data) < 50:
-                logger.warning(f"Insufficient data for {ticker} (rows: {len(data)})")
-                return None
-            required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
-            if not all(col in data.columns for col in required_columns):
-                logger.warning(f"Missing required columns for {ticker}: {data.columns}")
-                return None
-            return data
-        except Exception as e:
-            logger.error(f"Error fetching data for {ticker}: {e}")
-            return None
+    # ----------------- Fetch Data with Cache and Retries -----------------
+    def fetch_stock_data(self, ticker: str, period: str = '3mo', interval: str = '1d') -> Optional[pd.DataFrame]:
+        cache_key = hashlib.md5(f"{ticker}_{period}_{interval}".encode()).hexdigest()
+        cache_file = f"cache_{cache_key}.pkl"
+        current_date = datetime.now().date().isoformat()
+        
+        # Check cache
+        if cache_key in self.data_cache and self.data_cache[cache_key]['date'] == current_date:
+            logger.info(f"Using cached data for {ticker}")
+            return self.data_cache[cache_key]['data']
+        
+        # Load from disk cache if exists and valid
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'rb') as f:
+                    cached = pickle.load(f)
+                if cached['date'] == current_date:
+                    self.data_cache[cache_key] = cached
+                    logger.info(f"Loaded cached data from disk for {ticker}")
+                    return cached['data']
+            except Exception as e:
+                logger.warning(f"Error loading cache for {ticker}: {e}")
+        
+        # Fetch new data with retries
+        for attempt in range(3):
+            try:
+                stock = yf.Ticker(ticker)
+                data = stock.history(period=period, interval=interval, timeout=10)
+                if data.empty or len(data) < 50:
+                    logger.warning(f"Insufficient data for {ticker} (rows: {len(data)})")
+                    return None
+                required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+                if not all(col in data.columns for col in required_columns):
+                    logger.warning(f"Missing required columns for {ticker}: {data.columns}")
+                    return None
+                # Save to cache
+                self.data_cache[cache_key] = {'date': current_date, 'data': data}
+                try:
+                    with open(cache_file, 'wb') as f:
+                        pickle.dump(self.data_cache[cache_key], f)
+                    logger.info(f"Saved data to cache for {ticker}")
+                except Exception as e:
+                    logger.warning(f"Error saving cache for {ticker}: {e}")
+                return data
+            except Exception as e:
+                logger.error(f"Attempt {attempt+1}/3 failed for {ticker}: {e}")
+                if attempt < 2:
+                    time.sleep(2)  # Wait before retry
+                else:
+                    logger.error(f"All attempts failed for {ticker}")
+                    return None
 
     # ----------------- Indicators -----------------
     def calculate_advanced_indicators(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
@@ -258,7 +329,9 @@ class AdvancedSwingTradingBot:
         all_features = pd.DataFrame()
         all_targets = pd.Series(dtype='int64')
         self.failed_tickers = []
-        for ticker in self.tickers:
+        training_tickers = random.sample(self.tickers, min(100, len(self.tickers)))
+        logger.info(f"Training ML model on {len(training_tickers)} tickers")
+        for ticker in training_tickers:
             df = self.fetch_stock_data(ticker)
             if df is None:
                 self.failed_tickers.append(ticker)
@@ -276,6 +349,7 @@ class AdvancedSwingTradingBot:
                 self.failed_tickers.append(ticker)
         if all_features.empty or len(all_targets) < 10:
             logger.warning("Insufficient data for ML training")
+            self.send_telegram_message("*Error*: Insufficient data for ML training. Check logs.")
             return
         try:
             X_train, X_test, y_train, y_test = train_test_split(all_features, all_targets, test_size=0.2, random_state=42)
@@ -291,6 +365,7 @@ class AdvancedSwingTradingBot:
                 logger.info(f"Failed tickers during ML training: {self.failed_tickers}")
         except Exception as e:
             logger.error(f"Error training ML: {e}")
+            self.send_telegram_message(f"*Error*: ML training failed: {e}")
             self.model = None
 
     def get_ml_signal(self, df: pd.DataFrame) -> str:
@@ -383,7 +458,7 @@ class AdvancedSwingTradingBot:
                 return
             url = f"https://api.telegram.org/bot{token}/sendMessage"
             payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
-            response = requests.post(url, data=payload)
+            response = requests.post(url, data=payload, timeout=10)
             response.raise_for_status()
             logger.info("Telegram message sent successfully")
         except Exception as e:
@@ -396,8 +471,6 @@ class AdvancedSwingTradingBot:
                 logger.warning(f"Invalid data for visualization in {ticker}")
                 return
             fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), gridspec_kw={'height_ratios': [3, 1]})
-            
-            # Price and EMA plot
             ax1.plot(df.index, df['Close'], label='Close', color='blue')
             ax1.plot(df.index, df['EMA_20'], label='EMA 20', color='green')
             ax1.plot(df.index, df['EMA_50'], label='EMA 50', color='red')
@@ -408,15 +481,12 @@ class AdvancedSwingTradingBot:
             ax1.set_title(f"{ticker} Price & EMA with Signals")
             ax1.legend()
             ax1.grid(True)
-            
-            # RSI plot
             ax2.plot(df.index, df['RSI'], label='RSI', color='purple')
             ax2.axhline(70, linestyle='--', alpha=0.5, color='red')
             ax2.axhline(30, linestyle='--', alpha=0.5, color='green')
             ax2.set_title("RSI")
             ax2.legend()
             ax2.grid(True)
-            
             plt.tight_layout()
             plt.savefig(f"{ticker}_chart.png")
             plt.close()
@@ -432,18 +502,11 @@ class AdvancedSwingTradingBot:
                 return {"Total_Return": 0.0, "Win_Rate": 0.0}
             df = df.copy()
             signals = []
-            failed_logged = False
-            for i in range(len(df)):
+            for i in range(50, len(df)):
                 window = df.iloc[:i+1]
-                if len(window) < 50:
-                    signals.append("HOLD")
-                    continue
                 signal = strategy_func(window)
-                if signal == "HOLD" and not failed_logged:
-                    if len(window) < 50 or window['RSI'].isna().all() or window['BB_Lower'].isna().all() or window['BB_Upper'].isna().all():
-                        logger.warning(f"Invalid data for {strategy_func.__name__} during backtest")
-                        failed_logged = True
                 signals.append(signal)
+            df = df[50:].copy()
             df['Signal'] = signals
             df['Returns'] = df['Close'].pct_change().shift(-1) * df['Signal'].map({"BUY": 1, "SELL": -1, "HOLD": 0})
             total_return = df['Returns'].sum()
@@ -477,8 +540,10 @@ class AdvancedSwingTradingBot:
             return {"Entry_Price": 0.0, "Take_Profit": 0.0, "Stop_Loss": 0.0}
 
     # ----------------- Process Single Ticker -----------------
+    @timeout(30)  # Timeout after 30 seconds per ticker
     def process_ticker(self, ticker: str) -> Optional[Dict]:
         try:
+            start_time = time.time()
             df = self.fetch_stock_data(ticker)
             if df is None:
                 self.failed_tickers.append(ticker)
@@ -497,15 +562,7 @@ class AdvancedSwingTradingBot:
             backtest_mean = self.backtest_strategy(df, self.strategy_mean_reversion)
             backtest_breakout = self.backtest_strategy(df, self.strategy_breakout)
             trade_details = self.calculate_trade_details(df, final_signal)
-            logger.info(
-                f"Processing {ticker}:\n"
-                f"  Signal: {final_signal} (ML: {signal_ml})\n"
-                f"  Trend: {signal_trend}, Mean: {signal_mean}, Breakout: {signal_breakout}\n"
-                f"  Backtest: Trend {backtest_trend['Total_Return']:.2f} (Win: {backtest_trend['Win_Rate']:.2f}), "
-                f"Mean {backtest_mean['Total_Return']:.2f} (Win: {backtest_mean['Win_Rate']:.2f}), "
-                f"Breakout {backtest_breakout['Total_Return']:.2f} (Win: {backtest_breakout['Win_Rate']:.2f})\n"
-                f"  Trade: Entry ${trade_details['Entry_Price']:.2f}, TP ${trade_details['Take_Profit']:.2f}, SL ${trade_details['Stop_Loss']:.2f}"
-            )
+            # Log only for debugging or Top 5
             result = {
                 'Ticker': ticker,
                 'Final_Signal': final_signal,
@@ -523,28 +580,14 @@ class AdvancedSwingTradingBot:
                 'Take_Profit': trade_details['Take_Profit'],
                 'Stop_Loss': trade_details['Stop_Loss']
             }
-            if final_signal != "HOLD":
-                weighted_score = (
-                    0.6 * max(backtest_trend['Total_Return'], backtest_mean['Total_Return'], backtest_breakout['Total_Return']) +
-                    0.4 * max(backtest_trend['Win_Rate'], backtest_mean['Win_Rate'], backtest_breakout['Win_Rate'])
-                )
-                if (max(backtest_trend['Total_Return'], backtest_mean['Total_Return'], backtest_breakout['Total_Return']) > 0.05 and
-                    max(backtest_trend['Win_Rate'], backtest_mean['Win_Rate'], backtest_breakout['Win_Rate']) > 0.7):
-                    win_rate = max(
-                        (backtest_trend['Win_Rate'] if signal_trend == final_signal else 0),
-                        (backtest_mean['Win_Rate'] if signal_mean == final_signal else 0),
-                        (backtest_breakout['Win_Rate'] if signal_breakout == final_signal else 0)
-                    )
-                    message = (
-                        f"*{ticker}* - *{final_signal}*\n"
-                        f"Entry: ${trade_details['Entry_Price']:.2f}\n"
-                        f"Take Profit: ${trade_details['Take_Profit']:.2f}\n"
-                        f"Stop Loss: ${trade_details['Stop_Loss']:.2f}\n"
-                        f"Win Rate: {win_rate*100:.1f}%"
-                    )
-                    self.send_telegram_message(message)
-            self.visualize_signals(df, ticker, final_signal)
+            if (final_signal != "HOLD" and
+                max(backtest_trend['Win_Rate'], backtest_mean['Win_Rate'], backtest_breakout['Win_Rate']) > 0.7):
+                logger.info(f"Processed {ticker} in {time.time() - start_time:.2f}s: Signal={final_signal}, ML={signal_ml}")
             return result
+        except TimeoutError:
+            logger.error(f"Timeout processing {ticker} after 30 seconds")
+            self.failed_tickers.append(ticker)
+            return None
         except Exception as e:
             logger.error(f"Error processing {ticker}: {e}")
             self.failed_tickers.append(ticker)
@@ -557,6 +600,7 @@ class AdvancedSwingTradingBot:
         is_manual_run = os.getenv('GITHUB_EVENT_NAME') == 'workflow_dispatch'
         is_nyse_open = self.is_nyse_open()
         market_status = "open" if is_nyse_open else "closed, using latest available prices"
+        start_time = time.time()
         
         logger.info(f"Starting Advanced Swing Trading Bot - Single Run (NYSE {market_status})")
         self.send_telegram_message(
@@ -565,11 +609,16 @@ class AdvancedSwingTradingBot:
         self.failed_tickers = []
         results = []
         
-        # Parallel processing of tickers
-        with Pool(processes=cpu_count()) as pool:
-            results = pool.map(self.process_ticker, self.tickers)
-        results = [r for r in results if r is not None]
-
+        # Parallel processing with limited processes
+        num_processes = min(cpu_count(), 4)  # Limit to 4 processes
+        logger.info(f"Using {num_processes} processes for multiprocessing")
+        with Pool(processes=num_processes) as pool:
+            for i, result in enumerate(pool.imap_unordered(self.process_ticker, self.tickers)):
+                if result is not None:
+                    results.append(result)
+                if (i + 1) % 50 == 0:
+                    logger.info(f"Processed {i + 1}/{len(self.tickers)} tickers")
+        
         if results:
             results_df = pd.DataFrame(results)
             results_df['Weighted_Score'] = (
@@ -578,6 +627,12 @@ class AdvancedSwingTradingBot:
             )
             top_picks = results_df[results_df['Final_Signal'] != "HOLD"].sort_values(by='Weighted_Score', ascending=False).head(5)
             if not top_picks.empty:
+                for _, row in top_picks.iterrows():
+                    df = self.fetch_stock_data(row['Ticker'])
+                    if df is not None:
+                        df = self.calculate_advanced_indicators(df)
+                        if df is not None:
+                            self.visualize_signals(df, row['Ticker'], row['Final_Signal'])
                 avg_return = top_picks[['Backtest_Trend', 'Backtest_Mean', 'Backtest_Breakout']].max(axis=1).mean()
                 avg_win_rate = top_picks[['Backtest_Trend_Win', 'Backtest_Mean_Win', 'Backtest_Breakout_Win']].max(axis=1).mean()
                 summary_message = (
@@ -601,12 +656,14 @@ class AdvancedSwingTradingBot:
                     )
                 self.send_telegram_message(summary_message)
             results_df.to_csv('trading_bot_summary.csv', index=False)
-            logger.info(f"Run Summary:\n{results_df.to_string(index=False)}")
-            logger.info("Summary saved to trading_bot_summary.csv")
+            logger.info(f"Run Summary saved to trading_bot_summary.csv")
         if self.failed_tickers:
             logger.info(f"Failed tickers during run: {self.failed_tickers}")
-            self.send_telegram_message(f"*Failed Tickers*\n{self.failed_tickers}")
-        logger.info("Single run completed.")
+            self.send_telegram_message(f"*Failed Tickers*\n{self.failed_tickers[:50]}{'...' if len(self.failed_tickers) > 50 else ''}")
+        elapsed_time = time.time() - start_time
+        logger.info(f"Single run completed in {elapsed_time:.2f}s")
+        if elapsed_time > 600:  # 10 minutes
+            self.send_telegram_message(f"*Warning*: Bot run took {elapsed_time/60:.1f} minutes, exceeding 10 minutes. Check logs.")
 
 if __name__ == "__main__":
     bot = AdvancedSwingTradingBot()
