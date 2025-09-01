@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Advanced Swing Trading Bot 10/10 – Full Version with Top Picks
+Advanced Swing Trading Bot 10/10 – Full Version with Simplified Telegram Output
 Free, GitHub Actions ready, no TA-Lib, no Alpha Vantage, JSON tickers
 """
 
@@ -31,12 +31,12 @@ logger = logging.getLogger(__name__)
 
 class AdvancedSwingTradingBot:
     def __init__(self):
-        self.tickers = self.load_tickers()  # Load tickers from JSON or default
+        self.tickers = self.load_tickers()
         self.model = None
         self.scaler = StandardScaler()
         self.portfolio = {}
         self.performance_history = []
-        self.failed_tickers = []  # Track failed tickers
+        self.failed_tickers = []
         self.api_keys = {
             'news_api': os.getenv('NEWS_API_KEY'),
             'telegram_bot': os.getenv('TELEGRAM_BOT_TOKEN'),
@@ -47,7 +47,6 @@ class AdvancedSwingTradingBot:
 
     # ----------------- Ticker Management -----------------
     def load_tickers(self) -> List[str]:
-        """Load tickers from tickers.json if exists, else use default."""
         default_tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META']
         if os.path.exists('tickers.json'):
             try:
@@ -545,11 +544,7 @@ class AdvancedSwingTradingBot:
                                     f"Entry: ${trade_details['Entry_Price']:.2f}\n"
                                     f"Take Profit: ${trade_details['Take_Profit']:.2f}\n"
                                     f"Stop Loss: ${trade_details['Stop_Loss']:.2f}\n"
-                                    f"Win Rate: {win_rate*100:.1f}%\n"
-                                    f"News Sentiment: {sentiment_news:.2f}\n"
-                                    f"Backtest: Trend {backtest_trend['Total_Return']:.2f}, Mean {backtest_mean['Total_Return']:.2f}, "
-                                    f"Breakout {backtest_breakout['Total_Return']:.2f}\n"
-                                    f"Score: {weighted_score:.2f}"
+                                    f"Win Rate: {win_rate*100:.1f}%"
                                 )
                                 self.send_telegram_message(message)
                 self.visualize_signals(df, ticker)
@@ -560,19 +555,32 @@ class AdvancedSwingTradingBot:
         # Create and save summary
         if results:
             results_df = pd.DataFrame(results)
-            # Sort by weighted score for summary
+            # Sort by weighted score for top picks
             results_df['Weighted_Score'] = (
                 0.4 * results_df[['Backtest_Trend', 'Backtest_Mean', 'Backtest_Breakout']].max(axis=1) +
                 0.3 * results_df[['Backtest_Trend_Win', 'Backtest_Mean_Win', 'Backtest_Breakout_Win']].max(axis=1) +
                 0.3 * results_df['News_Sentiment'].abs()
             )
             top_picks = results_df[results_df['Final_Signal'] != "HOLD"].sort_values(by='Weighted_Score', ascending=False).head(5)
-            summary = results_df.to_string(index=False)
-            logger.info(f"Run Summary:\n{summary}")
+            # Create simplified Telegram summary for top picks
             if not top_picks.empty:
-                top_picks_summary = top_picks.to_string(index=False)
-                self.send_telegram_message(f"*Top 5 Picks*\n```\n{top_picks_summary}\n```")
+                summary_message = f"*Top 5 Trading Picks for {datetime.now().date()}*\n"
+                for idx, row in top_picks.iterrows():
+                    win_rate = max(
+                        (row['Backtest_Trend_Win'] if row['Trend_Signal'] == row['Final_Signal'] else 0),
+                        (row['Backtest_Mean_Win'] if row['Mean_Signal'] == row['Final_Signal'] else 0),
+                        (row['Backtest_Breakout_Win'] if row['Breakout_Signal'] == row['Final_Signal'] else 0)
+                    )
+                    summary_message += (
+                        f"{idx + 1}. *{row['Ticker']}* - *{row['Final_Signal']}*\n"
+                        f"   Entry: ${row['Entry_Price']:.2f}\n"
+                        f"   Take Profit: ${row['Take_Profit']:.2f}\n"
+                        f"   Stop Loss: ${row['Stop_Loss']:.2f}\n"
+                        f"   Win Rate: {win_rate*100:.1f}%\n\n"
+                    )
+                self.send_telegram_message(summary_message)
             results_df.to_csv('trading_bot_summary.csv', index=False)
+            logger.info(f"Run Summary:\n{results_df.to_string(index=False)}")
             logger.info("Summary saved to trading_bot_summary.csv")
         if self.failed_tickers:
             logger.info(f"Failed tickers during run: {self.failed_tickers}")
