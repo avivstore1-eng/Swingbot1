@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Advanced Swing Trading Bot – גרסת 10/10 בעברית
-- חינמי: yfinance + טלגרם אופציונלי
-- בטוח להרצה ב-GitHub Actions (matplotlib Agg)
-- משמר את כל היכולות של הגרסה הקודמת + תיקונים (ADX מדויק, BB בטוח, קאש, התמדה של מודל)
-- הודעות ותקצירים בעברית, כולל מצב ריצה ברור (פתוח/סגור/מוגבל)
+Advanced Swing Trading Bot – גרסת "מקסימום" בעברית (חינמי)
+- ריצה מלאה על *כל* הטיקרים תמיד (גם כשהשוק סגור)
+- אימון ML על *כל* הטיקרים אם xgboost זמין (אחרת ממשיך בלי ML)
+- סינון נזילות/מחיר, פילטר מצב שוק SPY, דירוג EV, גודל פוזיציה ATR, Trailing Stop, Cooldown
+- מקביליות בטוחה ל-500 טיקרים (ThreadPool), קאש יומי, גרפים CI-safe
+- הודעות טלגרם בעברית עם פירוט גודל פוזיציה ו-Trailing Stop
 """
 
 import os
 import time
 import json
-import math
 import pickle
 import random
 import hashlib
@@ -33,11 +33,37 @@ import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ===================== תצורה גלובלית =====================
+
+# כופה ניתוח מלא תמיד (גם כשהשוק סגור)
+FORCE_ANALYSIS_WHEN_CLOSED = True
+
+# הון וירטואלי (לדמו/סימולציה של גודל עסקה)
+EQUITY = float(os.getenv("EQUITY", "100000"))             # ברירת מחדל: 100K$
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))  # 1% סיכון לעסקה
+COOLDOWN_DAYS = int(os.getenv("COOLDOWN_DAYS", "2"))         # מניעת היפוך מהיר
+
+# מקביליות (איזון מול רייט-לימיט של yfinance)
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
+
+# קבצים
+MODEL_PATH = "model.pkl"
+SCALER_PATH = "scaler.pkl"
+CACHE_PREFIX = "cache_"
+RESULTS_CSV = "trading_bot_summary.csv"
+RESULTS_CSV_LIMITED = "trading_bot_summary_limited.csv"  # נשמר לשקיפות
+
+# טלגרם (אופציונלי; חינמי)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
 # שחזוריות
 random.seed(42)
 np.random.seed(42)
 
-# נסה xgboost (חינמי). אם חסר—הבוט עדיין ירוץ בלי ה-ML.
+# נסה xgboost (חינמי). אם חסר—הבוט ממשיך בלי ML.
 try:
     import xgboost as xgb
     XGB_AVAILABLE = True
@@ -51,18 +77,6 @@ logging.basicConfig(
     handlers=[logging.FileHandler("trading_bot.log"), logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
-
-# ===== תצורה =====
-FORCE_ANALYSIS_WHEN_CLOSED = os.getenv("FORCE_ANALYSIS_WHEN_CLOSED", "true").lower() == "true"  # אמת=לנתח גם כשהשוק סגור
-MODEL_PATH = "model.pkl"
-SCALER_PATH = "scaler.pkl"
-CACHE_PREFIX = "cache_"
-RESULTS_CSV = "trading_bot_summary.csv"
-RESULTS_CSV_LIMITED = "trading_bot_summary_limited.csv"
-
-# טלגרם (אופציונלי; חינמי)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
 # ===================== עזר =====================
@@ -86,7 +100,7 @@ def send_telegram_message(message: str):
 
 def load_tickers() -> List[str]:
     """טעינת טיקרים מ-tickers.json (או ברירת מחדל)."""
-    blacklist = {"ANSS"}  # דוגמה לטיקר בעייתי
+    blacklist = {"ANSS"}  # דוגמה לטיקר בעייתי; אפשר להסיר אם תרצה
     test_tickers = ["AAPL", "MSFT", "GOOGL"]
     default_tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "META"]
 
@@ -114,45 +128,35 @@ def load_tickers() -> List[str]:
 def is_nyse_holiday(date_obj: datetime.date) -> bool:
     """חגים עיקריים של NYSE לשנים 2024–2026 (קירוב ללא תלות חיצונית)."""
     def nth_weekday(year, month, weekday, n):
-        # weekday: שני=0 ... ראשון=6
         d = datetime(year, month, 1)
         offset = (weekday - d.weekday()) % 7
         day = 1 + offset + (n - 1) * 7
         return datetime(year, month, day).date()
 
-    y = date_obj.year
     holidays = set()
-
     for year in [2024, 2025, 2026]:
-        # New Year's Day (observed)
         new_year = datetime(year, 1, 1).date()
-        if new_year.weekday() == 5:     # שבת -> שישי
-            holidays.add(new_year - timedelta(days=1))
-        elif new_year.weekday() == 6:   # ראשון -> שני
-            holidays.add(new_year + timedelta(days=1))
-        else:
-            holidays.add(new_year)
-
-        # MLK – שני שלישי בינואר
-        holidays.add(nth_weekday(year, 1, 0, 3))
-        # Presidents' Day – שני שלישי בפברואר
-        holidays.add(nth_weekday(year, 2, 0, 3))
-        # Memorial Day – שני אחרון במאי
-        last_may = datetime(year, 5, 31).date()
+        holidays.add(new_year - timedelta(days=1) if new_year.weekday() == 5
+                     else new_year + timedelta(days=1) if new_year.weekday() == 6
+                     else new_year)
+        holidays.add(nth_weekday(year, 1, 0, 3))             # MLK
+        holidays.add(nth_weekday(year, 2, 0, 3))             # Presidents' Day
+        last_may = datetime(year, 5, 31).date()              # Memorial Day
         holidays.add(last_may - timedelta(days=(last_may.weekday() - 0) % 7))
-        # Juneteenth – 19 ביוני (observed)
-        jun19 = datetime(year, 6, 19).date()
-        holidays.add(jun19 - timedelta(days=1) if jun19.weekday() == 5 else (jun19 + timedelta(days=1) if jun19.weekday() == 6 else jun19))
-        # Independence Day – 4 ביולי (observed)
-        july4 = datetime(year, 7, 4).date()
-        holidays.add(july4 - timedelta(days=1) if july4.weekday() == 5 else (july4 + timedelta(days=1) if july4.weekday() == 6 else july4))
-        # Labor Day – שני ראשון בספטמבר
-        holidays.add(nth_weekday(year, 9, 0, 1))
-        # Thanksgiving – חמישי רביעי בנובמבר
-        holidays.add(nth_weekday(year, 11, 3, 4))
-        # Christmas – 25 בדצמבר (observed)
-        xmas = datetime(year, 12, 25).date()
-        holidays.add(xmas - timedelta(days=1) if xmas.weekday() == 5 else (xmas + timedelta(days=1) if xmas.weekday() == 6 else xmas))
+        jun19 = datetime(year, 6, 19).date()                 # Juneteenth observed
+        holidays.add(jun19 - timedelta(days=1) if jun19.weekday() == 5
+                     else jun19 + timedelta(days=1) if jun19.weekday() == 6
+                     else jun19)
+        july4 = datetime(year, 7, 4).date()                  # Independence Day observed
+        holidays.add(july4 - timedelta(days=1) if july4.weekday() == 5
+                     else july4 + timedelta(days=1) if july4.weekday() == 6
+                     else july4)
+        holidays.add(nth_weekday(year, 9, 0, 1))             # Labor Day
+        holidays.add(nth_weekday(year, 11, 3, 4))            # Thanksgiving
+        xmas = datetime(year, 12, 25).date()                 # Christmas observed
+        holidays.add(xmas - timedelta(days=1) if xmas.weekday() == 5
+                     else xmas + timedelta(days=1) if xmas.weekday() == 6
+                     else xmas)
 
     return date_obj in holidays
 
@@ -271,7 +275,7 @@ def compute_ADX(df: pd.DataFrame, period: int = 14):
 def calculate_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     try:
         if len(df) < 50:
-            logger.warning(f"פחות מ-50 שורות—אין מספיק נתונים לאינדיקטורים.")
+            logger.warning("פחות מ-50 שורות—אין מספיק נתונים לאינדיקטורים.")
             return None
         df = df.copy()
         df["EMA_20"] = df["Close"].ewm(span=20, adjust=False).mean()
@@ -303,7 +307,7 @@ def calculate_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         return None
 
 
-# ===================== נתונים =====================
+# ===================== נתונים + קאש =====================
 
 _data_cache: Dict[str, Dict] = {}
 
@@ -411,7 +415,7 @@ def prepare_ml_dataset(df: pd.DataFrame):
 
 
 def load_or_train_model(tickers: List[str]):
-    """שומר/טוען מודל כדי לחסוך זמן ב-CI. נשאר חינמי."""
+    """שומר/טוען מודל כדי לחסוך זמן ב-CI. אימון על *כל* הטיקרים (חינמי)."""
     model = None
     scaler = None
 
@@ -427,16 +431,17 @@ def load_or_train_model(tickers: List[str]):
         except Exception as e:
             logger.warning(f"כשל טעינת מודל/סקיילר: {e}")
 
-    # אימון
     if not XGB_AVAILABLE:
         send_telegram_message("*שגיאה קריטית*: לא מותקן xgboost. התקן עם: `pip install xgboost`.\nהבוט ימשיך בלי ML.")
         logger.error("xgboost חסר. ML יושבת.")
         return None, StandardScaler()
 
+    # אימון על כל הטיקרים
+    training_tickers = tickers
+    logger.info(f"אימון ML על {len(training_tickers)} טיקרים...")
+
     all_X = pd.DataFrame()
     all_y = pd.Series(dtype="int64")
-    training_tickers = random.sample(tickers, min(25, len(tickers)))
-    logger.info(f"אימון ML על {len(training_tickers)} טיקרים...")
 
     for t in training_tickers:
         df = fetch_stock_data(t)
@@ -471,7 +476,8 @@ def load_or_train_model(tickers: List[str]):
         eval_metric="logloss",
         n_jobs=2,
     )
-    model.fit(X_train_s, y_train)
+    # Early stopping (חינם): מונע אוברפיטינג
+    model.fit(X_train_s, y_train, eval_set=[(X_test_s, y_test)], early_stopping_rounds=30, verbose=False)
     train_score = model.score(X_train_s, y_train)
     test_score = model.score(X_test_s, y_test)
     logger.info(f"מודל XGB אומן. Train={train_score:.3f}, Test={test_score:.3f}")
@@ -544,37 +550,118 @@ def vote_final_signal(signals: List[str]) -> str:
     return "HOLD"
 
 
-# ===================== Backtest ודירוג =====================
+# ===================== פילטרי "רווח מקסימלי" =====================
+
+def market_regime_long_allowed() -> bool:
+    """לונגים רק כשה-SPY במגמת עליה בסיסית (EMA20>EMA50)."""
+    spy = fetch_stock_data("SPY", period="6mo", interval="1d")
+    if spy is None or len(spy) < 50:
+        return True
+    spy = calculate_indicators(spy)
+    if spy is None:
+        return True
+    latest = spy.iloc[-1]
+    return bool(latest["EMA_20"] > latest["EMA_50"])
+
+
+def market_regime_short_allowed() -> bool:
+    """שורטים רק כשה-SPY במגמת ירידה בסיסית (EMA20<EMA50)."""
+    spy = fetch_stock_data("SPY", period="6mo", interval="1d")
+    if spy is None or len(spy) < 50:
+        return True
+    spy = calculate_indicators(spy)
+    if spy is None:
+        return True
+    latest = spy.iloc[-1]
+    return bool(latest["EMA_20"] < latest["EMA_50"])
+
+
+def passes_liquidity_filter(df: pd.DataFrame) -> bool:
+    """נזילות/מחיר: מחיר >$5 ונפח ממוצע 20 יום > 300k."""
+    try:
+        price_ok = df["Close"].iloc[-1] >= 5
+        vol_ma = df["Volume"].rolling(20).mean().iloc[-1]
+        vol_ok = (vol_ma is not None) and (vol_ma >= 300_000)
+        return bool(price_ok and vol_ok)
+    except Exception:
+        return False
+
+
+# ===================== Backtest מתקדם + דירוג EV =====================
 
 def backtest_day_ahead(df: pd.DataFrame, strategy_func) -> Dict[str, float]:
-    """מודל פשוט: תשואת יום קדימה לפי האיתות."""
+    """
+    Backtest יומי קדימה: מחזיר WinRate, ממוצע חיובי/שלילי וה-EV (חישוב גס).
+    EV ≈ p*avg_pos - (1-p)*avg_neg
+    """
     try:
         if len(df) < 50:
-            return {"Total_Return": 0.0, "Win_Rate": 0.0}
-        rows = []
+            return {"Total_Return": 0.0, "Win_Rate": 0.0, "Avg_Pos": 0.0, "Avg_Neg": 0.0, "EV": 0.0}
+        pnl = []
+        pos_moves = []
+        neg_moves = []
         for i in range(50, len(df) - 1):
             window = df.iloc[: i + 1]
             sig = strategy_func(window)
             day_ret = df["Close"].iloc[i + 1] / df["Close"].iloc[i] - 1
             pos = 1 if sig == "BUY" else (-1 if sig == "SELL" else 0)
-            rows.append(pos * day_ret)
-        if not rows:
-            return {"Total_Return": 0.0, "Win_Rate": 0.0}
-        returns = pd.Series(rows)
-        total_return = returns.sum()
-        win_rate = (returns > 0).mean()
-        return {"Total_Return": float(total_return), "Win_Rate": float(win_rate)}
+            trade_ret = pos * day_ret
+            if pos != 0:
+                pnl.append(trade_ret)
+                if trade_ret > 0:
+                    pos_moves.append(trade_ret)
+                elif trade_ret < 0:
+                    neg_moves.append(abs(trade_ret))
+        if not pnl:
+            return {"Total_Return": 0.0, "Win_Rate": 0.0, "Avg_Pos": 0.0, "Avg_Neg": 0.0, "EV": 0.0}
+        s = pd.Series(pnl)
+        win_rate = (s > 0).mean()
+        avg_pos = float(np.mean(pos_moves)) if pos_moves else 0.0
+        avg_neg = float(np.mean(neg_moves)) if neg_moves else 0.0
+        ev = float(win_rate * avg_pos - (1 - win_rate) * avg_neg)
+        return {"Total_Return": float(s.sum()), "Win_Rate": float(win_rate), "Avg_Pos": avg_pos, "Avg_Neg": avg_neg, "EV": ev}
     except Exception as e:
         logger.error(f"שגיאת Backtest: {e}")
-        return {"Total_Return": 0.0, "Win_Rate": 0.0}
+        return {"Total_Return": 0.0, "Win_Rate": 0.0, "Avg_Pos": 0.0, "Avg_Neg": 0.0, "EV": 0.0}
 
 
 def weighted_score(row: pd.Series) -> float:
-    """ציון משוקלל מנורמל: מקס' תשואה של אסטרטגיה + win rate תואם."""
-    ret_max = max(abs(row["Backtest_Trend"]), abs(row["Backtest_Mean"]), abs(row["Backtest_Breakout"]), 1e-9)
-    ret_norm = max(row["Backtest_Trend"], row["Backtest_Mean"], row["Backtest_Breakout"]) / ret_max
-    win_norm = max(row["Backtest_Trend_Win"], row["Backtest_Mean_Win"], row["Backtest_Breakout_Win"])
-    return 0.6 * ret_norm + 0.4 * win_norm
+    """דירוג לפי EV (80%) + WinRate (20%)."""
+    return 0.8 * float(row.get("Best_EV", 0.0)) + 0.2 * float(row.get("Best_WinRate", 0.0))
+
+
+# ===================== ניהול פוזיציה: ATR Sizing + Trailing =====================
+
+def position_size_by_atr(entry_price: float, atr: float) -> int:
+    """
+    גודל פוזיציה לפי סיכון קבוע: כמה מניות כדי לסכן ~RISK_PER_TRADE מההון כאשר סטופ=ATR אחד.
+    """
+    if entry_price <= 0 or atr <= 0:
+        return 0
+    risk_dollars = EQUITY * RISK_PER_TRADE
+    per_share_risk = atr
+    shares = int(max(0, risk_dollars // per_share_risk))
+    # אל תגזים: לא יותר מ-20% הון לפוזיציה
+    max_shares_by_cap = int((EQUITY * 0.2) // entry_price)
+    return max(0, min(shares, max_shares_by_cap))
+
+
+def trailing_stop_levels(entry: float, atr: float, side: str, multiple: float = 1.5) -> float:
+    """
+    Trailing Stop לפי ATR: לונג – סטופ מתחת לכניסה במרחק multiple*ATR, שורט – מעל.
+    (הניהול בפועל יתבצע בסימולטור/דמו; כאן מחושב ערך התחלתי להצגה.)
+    """
+    if atr <= 0:
+        return entry
+    if side == "BUY":
+        return max(0.0, entry - multiple * atr)
+    elif side == "SELL":
+        return entry + multiple * atr
+    return entry
+
+
+# מעקב אחר איתות אחרון לטיקר (למנגנון COOLDOWN)
+_last_signal_date: Dict[str, Dict[str, datetime]] = {}
 
 
 # ===================== ויזואליזציה =====================
@@ -648,10 +735,11 @@ class AdvancedSwingTradingBot:
                 sl = entry + 1 * atr
             else:
                 tp = sl = entry
-            return {"Entry_Price": entry, "Take_Profit": tp, "Stop_Loss": sl}
+            size = position_size_by_atr(entry, atr)
+            return {"Entry_Price": entry, "Take_Profit": tp, "Stop_Loss": sl, "Size": size}
         except Exception as e:
             logger.error(f"שגיאה בחישוב פרטי עסקה: {e}")
-            return {"Entry_Price": 0.0, "Take_Profit": 0.0, "Stop_Loss": 0.0}
+            return {"Entry_Price": 0.0, "Take_Profit": 0.0, "Stop_Loss": 0.0, "Size": 0}
 
     def update_portfolio(self, ticker: str, signal: str):
         try:
@@ -679,6 +767,10 @@ class AdvancedSwingTradingBot:
                 self.failed_tickers.append(ticker)
                 return None
 
+            # סינון נזילות/מחיר – מפחית רעש
+            if not passes_liquidity_filter(df):
+                return None
+
             s_trend = strategy_trend_following(df)
             s_mean = strategy_mean_reversion(df)
             s_break = strategy_breakout(df)
@@ -687,11 +779,32 @@ class AdvancedSwingTradingBot:
             signals = [s_trend, s_mean, s_break, s_ml]
             final_signal = vote_final_signal(signals)
 
+            # פילטר מצב שוק: לא לונגים כש-SPY חלש, לא שורטים כש-SPY חזק
+            if final_signal == "BUY" and not market_regime_long_allowed():
+                final_signal = "HOLD"
+            if final_signal == "SELL" and not market_regime_short_allowed():
+                final_signal = "HOLD"
+
+            # Backtests + EV
             bt_trend = backtest_day_ahead(df, strategy_func=strategy_trend_following)
-            bt_mean = backtest_day_ahead(df, strategy_func=strategy_mean_reversion)
+            bt_mean  = backtest_day_ahead(df, strategy_func=strategy_mean_reversion)
             bt_break = backtest_day_ahead(df, strategy_func=strategy_breakout)
 
+            best_ev = max(bt_trend["EV"], bt_mean["EV"], bt_break["EV"])
+            best_wr = max(bt_trend["Win_Rate"], bt_mean["Win_Rate"], bt_break["Win_Rate"])
+
+            # קירור אותות – מניעת היפוך מהיר
+            today = datetime.utcnow().date()
+            ls = _last_signal_date.get(ticker, {})
+            if final_signal in ("BUY", "SELL"):
+                other = "SELL" if final_signal == "BUY" else "BUY"
+                if ls.get(other) and (today - ls[other].date()).days < COOLDOWN_DAYS:
+                    final_signal = "HOLD"
+            if final_signal in ("BUY", "SELL"):
+                _last_signal_date[ticker] = {final_signal: datetime.utcnow()}
+
             trade = self.calc_trade_details(df, final_signal)
+            trailing = trailing_stop_levels(trade["Entry_Price"], df.iloc[-1]["ATR"], final_signal)
 
             result = {
                 "Ticker": ticker,
@@ -706,9 +819,13 @@ class AdvancedSwingTradingBot:
                 "Backtest_Mean_Win": bt_mean["Win_Rate"],
                 "Backtest_Breakout": bt_break["Total_Return"],
                 "Backtest_Breakout_Win": bt_break["Win_Rate"],
+                "Best_EV": best_ev,
+                "Best_WinRate": best_wr,
                 "Entry_Price": trade["Entry_Price"],
                 "Take_Profit": trade["Take_Profit"],
                 "Stop_Loss": trade["Stop_Loss"],
+                "Trailing_Stop": trailing,
+                "Size": trade.get("Size", 0),
             }
             return result
         except Exception as e:
@@ -716,33 +833,38 @@ class AdvancedSwingTradingBot:
             self.failed_tickers.append(ticker)
             return None
 
-    def _send_no_picks_summary(self, analyzed: int, limited: bool):
-        mode = "מצומצם (דגימה)" if limited else "מלא"
+    def _send_no_picks_summary(self, analyzed: int, mode: str):
         send_telegram_message(
             f"*סיכום {datetime.utcnow().date()}*\n"
             f"מצב ריצה: {mode}\n"
-            f"נסקרו {analyzed} טיקרים.\n"
+            f"נסקרו {analyzed} טיקרים (כולם).\n"
             f"לא נמצאו בחירות פעולה (כולם HOLD). קבצים נשמרו כארטיפקטים."
         )
 
     def run_full_strategy(self):
+        """ריצה מלאה – על *כל* הטיקרים תמיד, במקביל."""
         results = []
         self.failed_tickers = []
 
-        logger.info(f"מעבד {len(self.tickers)} טיקרים...")
-        for t in self.tickers:
-            res = self.process_ticker(t)
-            if res:
-                results.append(res)
+        logger.info(f"מעבד {len(self.tickers)} טיקרים במקביל ({MAX_WORKERS} חוטים)...")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            fut = {ex.submit(self.process_ticker, t): t for t in self.tickers}
+            for f in as_completed(fut):
+                r = f.result()
+                if r:
+                    results.append(r)
 
         if not results:
             logger.warning("לא הופקו תוצאות כלל.")
-            self._send_no_picks_summary(0, limited=False)
+            self._send_no_picks_summary(0, mode="מלא (כל הטיקרים)")
             return
 
         df = pd.DataFrame(results)
         df["Weighted_Score"] = df.apply(weighted_score, axis=1)
-        top = df[df["Final_Signal"] != "HOLD"].sort_values("Weighted_Score", ascending=False).head(5)
+
+        # בחר טופ רק עם EV חיובי וסיגנל פעיל
+        picks = df[(df["Final_Signal"] != "HOLD") & (df["Best_EV"] > 0)].copy()
+        top = picks.sort_values("Weighted_Score", ascending=False).head(5)
 
         if not top.empty:
             for _, row in top.iterrows():
@@ -754,29 +876,23 @@ class AdvancedSwingTradingBot:
                     continue
                 visualize_signals(di, row["Ticker"], row["Final_Signal"])
 
-            avg_ret = top[["Backtest_Trend", "Backtest_Mean", "Backtest_Breakout"]].max(axis=1).mean()
-            avg_win = top[["Backtest_Trend_Win", "Backtest_Mean_Win", "Backtest_Breakout_Win"]].max(axis=1).mean()
+            avg_ev = float(top["Best_EV"].mean())
+            avg_wr = float(top["Best_WinRate"].mean())
             market_status = "פתוחה" if is_nyse_open_now() else "סגורה – משתמש בנתונים העדכניים האחרונים"
             msg = f"*5 הבחירות המובילות ל-{datetime.utcnow().date()}*\n" \
                   f"*סטטוס שוק*: NYSE {market_status}\n" \
-                  f"*תשואה ממוצעת (Backtest)*: {avg_ret*100:.1f}%\n" \
-                  f"*שיעור הצלחה ממוצע*: {avg_win*100:.1f}%\n\n"
+                  f"*EV ממוצע*: {avg_ev*100:.2f}‰  (אחוזים אלפיים לטרייד)\n" \
+                  f"*Win Rate ממוצע (Backtest)*: {avg_wr*100:.1f}%\n\n"
             for i, (_, row) in enumerate(top.iterrows(), start=1):
-                win_rate = max(
-                    row["Backtest_Trend_Win"] if row["Trend_Signal"] == row["Final_Signal"] else 0,
-                    row["Backtest_Mean_Win"] if row["Mean_Signal"] == row["Final_Signal"] else 0,
-                    row["Backtest_Breakout_Win"] if row["Breakout_Signal"] == row["Final_Signal"] else 0,
-                )
                 msg += (
                     f"{i}. *{row['Ticker']}* — *{row['Final_Signal']}*\n"
-                    f"   כניסה: ${row['Entry_Price']:.2f}\n"
-                    f"   טייק פרופיט: ${row['Take_Profit']:.2f}\n"
-                    f"   סטופ-לוס: ${row['Stop_Loss']:.2f}\n"
-                    f"   שיעור הצלחה מוערך: {win_rate*100:.1f}%\n\n"
+                    f"   כניסה: ${row['Entry_Price']:.2f} | גודל מומלץ: {int(row['Size'])} מניות\n"
+                    f"   TP: ${row['Take_Profit']:.2f} | SL: ${row['Stop_Loss']:.2f} | Trailing: ${row['Trailing_Stop']:.2f}\n"
+                    f"   EV: {row['Best_EV']*100:.2f}‰ | WinRate: {row['Best_WinRate']*100:.1f}%\n\n"
                 )
             send_telegram_message(msg)
         else:
-            self._send_no_picks_summary(len(df), limited=False)
+            self._send_no_picks_summary(len(df), mode="מלא (כל הטיקרים)")
 
         df.to_csv(RESULTS_CSV, index=False)
         logger.info(f"נשמר סיכום ל-{RESULTS_CSV}")
@@ -785,43 +901,40 @@ class AdvancedSwingTradingBot:
             send_telegram_message(f"*טיקרים שנכשלו בעיבוד*\n{self.failed_tickers[:50]}{'...' if len(self.failed_tickers) > 50 else ''}")
 
     def run_single_run(self):
-        """ריצה מצומצמת כשהשוק סגור (אם לא כופים ניתוח מלא)."""
-        sample = random.sample(self.tickers, min(15, len(self.tickers)))
+        """גם 'מצומצם' ירוץ על *כל* הטיקרים – לשקיפות והתנהגות אחידה."""
         results = []
         self.failed_tickers = []
 
-        for t in sample:
-            res = self.process_ticker(t)
-            if res:
-                results.append(res)
+        logger.info(f"מעבד {len(self.tickers)} טיקרים במקביל ({MAX_WORKERS} חוטים)...")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            fut = {ex.submit(self.process_ticker, t): t for t in self.tickers}
+            for f in as_completed(fut):
+                r = f.result()
+                if r:
+                    results.append(r)
 
         if not results:
-            self._send_no_picks_summary(0, limited=True)
+            self._send_no_picks_summary(0, mode="מצומצם (על כל הטיקרים)")
             return
 
         df = pd.DataFrame(results)
         df["Weighted_Score"] = df.apply(weighted_score, axis=1)
-        top = df[df["Final_Signal"] != "HOLD"].sort_values("Weighted_Score", ascending=False).head(3)
+        picks = df[(df["Final_Signal"] != "HOLD") & (df["Best_EV"] > 0)].copy()
+        top = picks.sort_values("Weighted_Score", ascending=False).head(3)
 
         if not top.empty:
             msg = f"*3 בחירות מובילות ל-{datetime.utcnow().date()} (ריצה מצומצמת)*\n" \
                   f"*סטטוס שוק*: NYSE סגורה – משתמש בנתונים העדכניים האחרונים\n\n"
             for i, (_, row) in enumerate(top.iterrows(), start=1):
-                win_rate = max(
-                    row["Backtest_Trend_Win"] if row["Trend_Signal"] == row["Final_Signal"] else 0,
-                    row["Backtest_Mean_Win"] if row["Mean_Signal"] == row["Final_Signal"] else 0,
-                    row["Backtest_Breakout_Win"] if row["Breakout_Signal"] == row["Final_Signal"] else 0,
-                )
                 msg += (
                     f"{i}. *{row['Ticker']}* — *{row['Final_Signal']}*\n"
-                    f"   כניסה: ${row['Entry_Price']:.2f}\n"
-                    f"   טייק פרופיט: ${row['Take_Profit']:.2f}\n"
-                    f"   סטופ-לוס: ${row['Stop_Loss']:.2f}\n"
-                    f"   שיעור הצלחה מוערך: {win_rate*100:.1f}%\n\n"
+                    f"   כניסה: ${row['Entry_Price']:.2f} | גודל מומלץ: {int(row['Size'])} מניות\n"
+                    f"   TP: ${row['Take_Profit']:.2f} | SL: ${row['Stop_Loss']:.2f} | Trailing: ${row['Trailing_Stop']:.2f}\n"
+                    f"   EV: {row['Best_EV']*100:.2f}‰ | WinRate: {row['Best_WinRate']*100:.1f}%\n\n"
                 )
             send_telegram_message(msg)
         else:
-            self._send_no_picks_summary(len(df), limited=True)
+            self._send_no_picks_summary(len(df), mode="מצומצם (על כל הטיקרים)")
 
         df.to_csv(RESULTS_CSV_LIMITED, index=False)
         logger.info(f"נשמר סיכום מצומצם ל-{RESULTS_CSV_LIMITED}")
@@ -833,28 +946,25 @@ class AdvancedSwingTradingBot:
         tz_ist = pytz.timezone("Asia/Jerusalem")
         now_ist = datetime.now(tz_ist)
         nyse_open = is_nyse_open_now()
-        mode = ("אסטרטגיה מלאה (שוק פתוח)" if nyse_open
-                else ("אסטרטגיה מלאה על נתונים עדכניים אחרונים" if FORCE_ANALYSIS_WHEN_CLOSED
-                      else "ריצה מצומצמת (דגימה)"))
+        mode = ("אסטרטגיה מלאה על *כל* הטיקרים (שוק פתוח)" if nyse_open
+                else "אסטרטגיה מלאה על *כל* הטיקרים (שוק סגור, נתונים עדכניים אחרונים)")
 
         send_telegram_message(
             f"*בוט מסחר – תחילת ריצה*\n"
             f"זמן מקומי: {now_ist}\n"
-            f"סטטוס NYSE: {'פתוחה' if nyse_open else 'סגורה'}\n"
-            f"מצב ריצה: {mode}"
+            f"סטטוס NYSE: {'פתוחה' אם nyse_open else 'סגורה'}\n"
+            f"מצב ריצה: {mode}\n"
+            f"פרמטרים: הון={EQUITY:,.0f}$ | סיכון לעסקה={RISK_PER_TRADE*100:.1f}% | Cooldown={COOLDOWN_DAYS} ימים | Workers={MAX_WORKERS}"
         )
 
         start = time.time()
         try:
-            if nyse_open:
+            if nyse_open or FORCE_ANALYSIS_WHEN_CLOSED:
+                logger.info("מריץ אסטרטגיה מלאה על כל הטיקרים.")
                 self.run_full_strategy()
             else:
-                if FORCE_ANALYSIS_WHEN_CLOSED:
-                    logger.info("שוק סגור – מריץ אסטרטגיה מלאה על הנתון האחרון.")
-                    self.run_full_strategy()
-                else:
-                    logger.info("שוק סגור – מריץ ריצה מצומצמת (דגימה).")
-                    self.run_single_run()
+                logger.info("שוק סגור – מריץ ריצה מצומצמת (אך על כל הטיקרים).")
+                self.run_single_run()
         finally:
             elapsed = time.time() - start
             if elapsed > 600:
