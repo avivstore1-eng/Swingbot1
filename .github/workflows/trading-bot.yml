@@ -43,10 +43,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Show xgboost version
-        run: python - << 'PY'
-import xgboost as xgb
-print("xgboost installed:", xgb.__version__)
-PY
+        run: python -c "import xgboost as xgb; print('xgboost installed:', xgb.__version__)"
 
       - name: Run trading bot
         env:
