@@ -36,6 +36,7 @@ class AdvancedSwingTradingBot:
         self.scaler = StandardScaler()
         self.portfolio = {}
         self.performance_history = []
+        self.failed_tickers = []  # Track failed tickers
         self.api_keys = {
             'news_api': os.getenv('NEWS_API_KEY'),
             'telegram_bot': os.getenv('TELEGRAM_BOT_TOKEN'),
@@ -90,74 +91,109 @@ class AdvancedSwingTradingBot:
             data = stock.history(period=period, interval=interval)
             if data.empty or len(data) < 50:
                 logger.warning(f"Insufficient data for {ticker} (rows: {len(data)})")
+                self.failed_tickers.append(ticker)
+                return None
+            # Ensure required columns exist
+            required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+            if not all(col in data.columns for col in required_columns):
+                logger.warning(f"Missing required columns for {ticker}: {data.columns}")
+                self.failed_tickers.append(ticker)
                 return None
             return data
         except Exception as e:
             logger.error(f"Error fetching data for {ticker}: {e}")
+            self.failed_tickers.append(ticker)
             return None
 
     # ----------------- Indicators -----------------
-    def calculate_advanced_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
-        df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
-        df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
-        df['RSI'] = self.compute_RSI(df['Close'], 14)
-        df['MACD'], df['MACD_Signal'], df['MACD_Hist'] = self.compute_MACD(df['Close'])
-        df['BB_Middle'] = df['Close'].rolling(20).mean()
-        df['BB_Upper'] = df['BB_Middle'] + 2 * df['Close'].rolling(20).std()
-        df['BB_Lower'] = df['BB_Middle'] - 2 * df['Close'].rolling(20).std()
-        df['SlowK'], df['SlowD'] = self.compute_stochastic(df)
-        df['Volume_MA'] = df['Volume'].rolling(20).mean()
-        df['Volume_Ratio'] = df['Volume'] / df['Volume_MA']
-        df['ATR'] = self.compute_ATR(df)
-        df['ADX'] = self.compute_ADX(df)
-        df['Price_vs_EMA20'] = df['Close'] / df['EMA_20'] - 1
-        df['Price_vs_EMA50'] = df['Close'] / df['EMA_50'] - 1
-        df = df.fillna(0)  # Handle NaNs
-        return df
+    def calculate_advanced_indicators(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        try:
+            if len(df) < 50:  # Ensure enough data for calculations
+                logger.warning(f"Insufficient rows ({len(df)}) for indicators calculation")
+                return None
+            df = df.copy()
+            df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
+            df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
+            df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
+            df['RSI'] = self.compute_RSI(df['Close'], 14)
+            df['MACD'], df['MACD_Signal'], df['MACD_Hist'] = self.compute_MACD(df['Close'])
+            df['BB_Middle'] = df['Close'].rolling(20).mean()
+            df['BB_Upper'] = df['BB_Middle'] + 2 * df['Close'].rolling(20).std()
+            df['BB_Lower'] = df['BB_Middle'] - 2 * df['Close'].rolling(20).std()
+            df['SlowK'], df['SlowD'] = self.compute_stochastic(df)
+            df['Volume_MA'] = df['Volume'].rolling(20).mean()
+            df['Volume_Ratio'] = df['Volume'] / df['Volume_MA']
+            df['ATR'] = self.compute_ATR(df)
+            df['ADX'] = self.compute_ADX(df)
+            df['Price_vs_EMA20'] = df['Close'] / df['EMA_20'] - 1
+            df['Price_vs_EMA50'] = df['Close'] / df['EMA_50'] - 1
+            df = df.fillna(0)  # Handle NaNs
+            return df
+        except Exception as e:
+            logger.error(f"Error calculating indicators: {e}")
+            return None
 
     # ----------------- Helper Indicator Functions -----------------
     def compute_RSI(self, series: pd.Series, period: int = 14) -> pd.Series:
-        delta = series.diff()
-        gain = delta.clip(lower=0)
-        loss = -1 * delta.clip(upper=0)
-        avg_gain = gain.rolling(period).mean()
-        avg_loss = loss.rolling(period).mean()
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
-        return rsi.fillna(50)
+        try:
+            delta = series.diff()
+            gain = delta.clip(lower=0)
+            loss = -1 * delta.clip(upper=0)
+            avg_gain = gain.rolling(period).mean()
+            avg_loss = loss.rolling(period).mean()
+            rs = avg_gain / avg_loss
+            rsi = 100 - (100 / (1 + rs))
+            return rsi.fillna(50)
+        except Exception as e:
+            logger.error(f"Error in RSI calculation: {e}")
+            return pd.Series(50, index=series.index)
 
     def compute_MACD(self, series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
-        fast_ema = series.ewm(span=fast, adjust=False).mean()
-        slow_ema = series.ewm(span=slow, adjust=False).mean()
-        macd = fast_ema - slow_ema
-        macd_signal = macd.ewm(span=signal, adjust=False).mean()
-        macd_hist = macd - macd_signal
-        return macd.fillna(0), macd_signal.fillna(0), macd_hist.fillna(0)
+        try:
+            fast_ema = series.ewm(span=fast, adjust=False).mean()
+            slow_ema = series.ewm(span=slow, adjust=False).mean()
+            macd = fast_ema - slow_ema
+            macd_signal = macd.ewm(span=signal, adjust=False).mean()
+            macd_hist = macd - macd_signal
+            return macd.fillna(0), macd_signal.fillna(0), macd_hist.fillna(0)
+        except Exception as e:
+            logger.error(f"Error in MACD calculation: {e}")
+            return pd.Series(0, index=series.index), pd.Series(0, index=series.index), pd.Series(0, index=series.index)
 
     def compute_stochastic(self, df: pd.DataFrame, k_period: int = 14, d_period: int = 3):
-        low_min = df['Low'].rolling(k_period).min()
-        high_max = df['High'].rolling(k_period).max()
-        k = 100 * (df['Close'] - low_min) / (high_max - low_min)
-        d = k.rolling(d_period).mean()
-        return k.fillna(50), d.fillna(50)
+        try:
+            low_min = df['Low'].rolling(k_period).min()
+            high_max = df['High'].rolling(k_period).max()
+            k = 100 * (df['Close'] - low_min) / (high_max - low_min)
+            d = k.rolling(d_period).mean()
+            return k.fillna(50), d.fillna(50)
+        except Exception as e:
+            logger.error(f"Error in stochastic calculation: {e}")
+            return pd.Series(50, index=df.index), pd.Series(50, index=df.index)
 
     def compute_ATR(self, df: pd.DataFrame, period: int = 14):
-        high_low = df['High'] - df['Low']
-        high_close = (df['High'] - df['Close'].shift()).abs()
-        low_close = (df['Low'] - df['Close'].shift()).abs()
-        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        atr = tr.rolling(period).mean()
-        return atr.fillna(0)
+        try:
+            high_low = df['High'] - df['Low']
+            high_close = (df['High'] - df['Close'].shift()).abs()
+            low_close = (df['Low'] - df['Close'].shift()).abs()
+            tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+            atr = tr.rolling(period).mean()
+            return atr.fillna(0)
+        except Exception as e:
+            logger.error(f"Error in ATR calculation: {e}")
+            return pd.Series(0, index=df.index)
 
     def compute_ADX(self, df: pd.DataFrame, period: int = 14):
-        plus_dm = df['High'].diff()
-        minus_dm = df['Low'].diff().abs()
-        tr = self.compute_ATR(df, period)
-        dx = 100 * (plus_dm - minus_dm).abs() / tr
-        adx = dx.rolling(period).mean()
-        return adx.fillna(0)
+        try:
+            plus_dm = df['High'].diff()
+            minus_dm = df['Low'].diff().abs()
+            tr = self.compute_ATR(df, period)
+            dx = 100 * (plus_dm - minus_dm).abs() / tr
+            adx = dx.rolling(period).mean()
+            return adx.fillna(0)
+        except Exception as e:
+            logger.error(f"Error in ADX calculation: {e}")
+            return pd.Series(0, index=df.index)
 
     # ----------------- News Sentiment -----------------
     def get_news_sentiment(self, ticker: str) -> float:
@@ -165,7 +201,7 @@ class AdvancedSwingTradingBot:
             if not self.api_keys['news_api']:
                 logger.warning(f"News API key missing for {ticker}. Using neutral sentiment. Get a key from https://newsapi.org/")
                 return 0.0
-            url = f"https://newsapi.org/v2/everything?q={ticker}&apiKey={self.api_keys['news_api']}"
+            url = f"https://newsapi.org/v2/everything?q={ticker}&apiKey={self.api_keys['news_api']}&language=en&from={datetime.now().date() - timedelta(days=14)}"
             response = requests.get(url)
             response.raise_for_status()
             articles = response.json().get('articles', [])[:10]
@@ -207,45 +243,57 @@ class AdvancedSwingTradingBot:
             return None
 
     def prepare_ml_data(self, df: pd.DataFrame):
-        features_df = pd.DataFrame()
-        targets = []
-        for i in range(50, len(df) - 5):
-            window = df.iloc[i-50:i]
-            latest = window.iloc[-1]
-            features = {
-                'EMA_20_vs_50': latest['EMA_20'] / latest['EMA_50'] - 1,
-                'EMA_20_vs_200': latest['EMA_20'] / latest['EMA_200'] - 1,
-                'Price_vs_EMA20': latest['Price_vs_EMA20'],
-                'Price_vs_EMA50': latest['Price_vs_EMA50'],
-                'RSI': latest['RSI'],
-                'MACD_Hist': latest['MACD_Hist'],
-                'BB_Position': (latest['Close'] - latest['BB_Lower']) / (latest['BB_Upper'] - latest['BB_Lower']),
-                'Volume_Ratio': latest['Volume_Ratio'],
-                'ATR': latest['ATR'],
-                'ADX': latest['ADX'],
-                'Stochastic': latest['SlowK'],
-                'Price_Change_1d': window['Close'].iloc[-1] / window['Close'].iloc[-2] - 1 if len(window) > 1 else 0,
-                'Price_Change_5d': window['Close'].iloc[-1] / window['Close'].iloc[-6] - 1 if len(window) > 5 else 0
-            }
-            features_df = pd.concat([features_df, pd.DataFrame([features])], ignore_index=True)
-            future_close = df['Close'].iloc[i + 5]
-            targets.append(1 if future_close > latest['Close'] else 0)
-        return features_df, pd.Series(targets, dtype='int64')
+        try:
+            if len(df) < 50:
+                logger.warning(f"Insufficient data rows ({len(df)}) for ML data. Skipping.")
+                return pd.DataFrame(), pd.Series(dtype='int64')
+            features_df = pd.DataFrame()
+            targets = []
+            for i in range(50, len(df) - 5):
+                window = df.iloc[i-50:i]
+                latest = window.iloc[-1]
+                features = {
+                    'EMA_20_vs_50': latest['EMA_20'] / latest['EMA_50'] - 1,
+                    'EMA_20_vs_200': latest['EMA_20'] / latest['EMA_200'] - 1,
+                    'Price_vs_EMA20': latest['Price_vs_EMA20'],
+                    'Price_vs_EMA50': latest['Price_vs_EMA50'],
+                    'RSI': latest['RSI'],
+                    'MACD_Hist': latest['MACD_Hist'],
+                    'BB_Position': (latest['Close'] - latest['BB_Lower']) / (latest['BB_Upper'] - latest['BB_Lower']),
+                    'Volume_Ratio': latest['Volume_Ratio'],
+                    'ATR': latest['ATR'],
+                    'ADX': latest['ADX'],
+                    'Stochastic': latest['SlowK'],
+                    'Price_Change_1d': window['Close'].iloc[-1] / window['Close'].iloc[-2] - 1 if len(window) > 1 else 0,
+                    'Price_Change_5d': window['Close'].iloc[-1] / window['Close'].iloc[-6] - 1 if len(window) > 5 else 0
+                }
+                features_df = pd.concat([features_df, pd.DataFrame([features])], ignore_index=True)
+                future_close = df['Close'].iloc[i + 5]
+                targets.append(1 if future_close > latest['Close'] else 0)
+            return features_df, pd.Series(targets, dtype='int64')
+        except Exception as e:
+            logger.error(f"Error preparing ML data: {e}")
+            return pd.DataFrame(), pd.Series(dtype='int64')
 
     def train_ml_model_all_tickers(self):
         all_features = pd.DataFrame()
         all_targets = pd.Series(dtype='int64')
+        self.failed_tickers = []  # Reset failed tickers
         for ticker in self.tickers:
             df = self.fetch_stock_data(ticker)
             if df is None:
                 continue
             df = self.calculate_advanced_indicators(df)
+            if df is None:
+                self.failed_tickers.append(ticker)
+                continue
             features, targets = self.prepare_ml_data(df)
             if not features.empty and not targets.empty:
                 all_features = pd.concat([all_features, features], ignore_index=True)
                 all_targets = pd.concat([all_targets, targets], ignore_index=True)
             else:
                 logger.warning(f"No valid ML data for {ticker}. Skipping.")
+                self.failed_tickers.append(ticker)
         if all_features.empty or len(all_targets) < 10:
             logger.warning("Insufficient data for ML training. Skipping.")
             return
@@ -259,6 +307,8 @@ class AdvancedSwingTradingBot:
             train_score = self.model.score(X_train_scaled, y_train)
             test_score = self.model.score(X_test_scaled, y_test)
             logger.info(f"ML Model trained - Train: {train_score:.2f}, Test: {test_score:.2f}")
+            if self.failed_tickers:
+                logger.info(f"Failed tickers during ML training: {self.failed_tickers}")
         except Exception as e:
             logger.error(f"Error training ML: {e}")
             self.model = None
@@ -279,48 +329,72 @@ class AdvancedSwingTradingBot:
 
     # ----------------- Strategies -----------------
     def strategy_trend_following(self, df: pd.DataFrame) -> str:
-        latest = df.iloc[-1]
-        if latest['EMA_20'] > latest['EMA_50'] > latest['EMA_200'] and latest['ADX'] > 25:
-            return "BUY"
-        elif latest['EMA_20'] < latest['EMA_50'] < latest['EMA_200']:
-            return "SELL"
-        return "HOLD"
+        try:
+            if len(df) < 50 or df['EMA_20'].isna().all() or df['EMA_50'].isna().all() or df['EMA_200'].isna().all():
+                logger.warning("Insufficient or invalid data for trend following strategy")
+                return "HOLD"
+            latest = df.iloc[-1]
+            if latest['EMA_20'] > latest['EMA_50'] > latest['EMA_200'] and latest['ADX'] > 25:
+                return "BUY"
+            elif latest['EMA_20'] < latest['EMA_50'] < latest['EMA_200']:
+                return "SELL"
+            return "HOLD"
+        except Exception as e:
+            logger.error(f"Error in trend following strategy: {e}")
+            return "HOLD"
 
     def strategy_mean_reversion(self, df: pd.DataFrame) -> str:
-        latest = df.iloc[-1]
-        if latest['RSI'] < 30 and latest['Close'] < latest['BB_Lower']:
-            return "BUY"
-        elif latest['RSI'] > 70 and latest['Close'] > latest['BB_Upper']:
-            return "SELL"
-        return "HOLD"
+        try:
+            if len(df) < 50 or df['RSI'].isna().all() or df['BB_Lower'].isna().all() or df['BB_Upper'].isna().all():
+                logger.warning("Insufficient or invalid data for mean reversion strategy")
+                return "HOLD"
+            latest = df.iloc[-1]
+            if latest['RSI'] < 30 and latest['Close'] < latest['BB_Lower']:
+                return "BUY"
+            elif latest['RSI'] > 70 and latest['Close'] > latest['BB_Upper']:
+                return "SELL"
+            return "HOLD"
+        except Exception as e:
+            logger.error(f"Error in mean reversion strategy: {e}")
+            return "HOLD"
 
     def strategy_breakout(self, df: pd.DataFrame) -> str:
-        latest = df.iloc[-1]
-        high_20 = df['High'].rolling(20).max().iloc[-2]
-        low_20 = df['Low'].rolling(20).min().iloc[-2]
-        if latest['Close'] > high_20:
-            return "BUY"
-        elif latest['Close'] < low_20:
-            return "SELL"
-        return "HOLD"
+        try:
+            if len(df) < 50 or df['High'].isna().all() or df['Low'].isna().all():
+                logger.warning("Insufficient or invalid data for breakout strategy")
+                return "HOLD"
+            latest = df.iloc[-1]
+            high_20 = df['High'].rolling(20).max().iloc[-2]
+            low_20 = df['Low'].rolling(20).min().iloc[-2]
+            if latest['Close'] > high_20:
+                return "BUY"
+            elif latest['Close'] < low_20:
+                return "SELL"
+            return "HOLD"
+        except Exception as e:
+            logger.error(f"Error in breakout strategy: {e}")
+            return "HOLD"
 
     # ----------------- Portfolio Management -----------------
     def update_portfolio(self, ticker: str, signal: str):
-        if ticker not in self.portfolio:
-            self.portfolio[ticker] = {"position": 0, "last_signal": "HOLD"}
-        current = self.portfolio[ticker]
-        if sum(abs(p['position']) for p in self.portfolio.values()) >= 5 and signal != "HOLD":
-            logger.warning(f"Portfolio limit reached. Skipping {signal} for {ticker}")
-            return
-        current['last_signal'] = signal
-        if signal == "BUY":
-            current['position'] = 1
-        elif signal == "SELL":
-            current['position'] = -1
-        else:
-            current['position'] = 0
-        self.portfolio[ticker] = current
-        logger.info(f"Portfolio updated: {ticker} -> {current}")
+        try:
+            if ticker not in self.portfolio:
+                self.portfolio[ticker] = {"position": 0, "last_signal": "HOLD"}
+            current = self.portfolio[ticker]
+            if sum(abs(p['position']) for p in self.portfolio.values()) >= 5 and signal != "HOLD":
+                logger.warning(f"Portfolio limit reached. Skipping {signal} for {ticker}")
+                return
+            current['last_signal'] = signal
+            if signal == "BUY":
+                current['position'] = 1
+            elif signal == "SELL":
+                current['position'] = -1
+            else:
+                current['position'] = 0
+            self.portfolio[ticker] = current
+            logger.info(f"Portfolio updated: {ticker} -> {current}")
+        except Exception as e:
+            logger.error(f"Error updating portfolio for {ticker}: {e}")
 
     # ----------------- Telegram Alerts -----------------
     def send_telegram_message(self, message: str):
@@ -358,48 +432,100 @@ class AdvancedSwingTradingBot:
 
     # ----------------- Backtesting -----------------
     def backtest_strategy(self, df: pd.DataFrame, strategy_func) -> Dict[str, float]:
-        df = df.copy()
-        signals = []
-        for i in range(len(df)):
-            signal = strategy_func(df.iloc[:i+1])
-            signals.append(signal)
-        df['Signal'] = signals
-        df['Returns'] = df['Close'].pct_change().shift(-1) * df['Signal'].map({"BUY": 1, "SELL": -1, "HOLD": 0})
-        total_return = df['Returns'].sum()
-        win_rate = (df['Returns'] > 0).mean() if len(df['Returns']) > 0 else 0
-        return {"Total_Return": total_return, "Win_Rate": win_rate}
+        try:
+            if len(df) < 50:
+                logger.warning("Insufficient data for backtesting")
+                return {"Total_Return": 0.0, "Win_Rate": 0.0}
+            df = df.copy()
+            signals = []
+            for i in range(len(df)):
+                signal = strategy_func(df.iloc[:i+1])
+                signals.append(signal)
+            df['Signal'] = signals
+            df['Returns'] = df['Close'].pct_change().shift(-1) * df['Signal'].map({"BUY": 1, "SELL": -1, "HOLD": 0})
+            total_return = df['Returns'].sum()
+            win_rate = (df['Returns'] > 0).mean() if len(df['Returns']) > 0 else 0
+            return {"Total_Return": total_return, "Win_Rate": win_rate}
+        except Exception as e:
+            logger.error(f"Error in backtesting: {e}")
+            return {"Total_Return": 0.0, "Win_Rate": 0.0}
 
     # ----------------- Run Bot -----------------
     def run_once(self):
         logger.info("Starting Advanced Swing Trading Bot - Single Run")
+        self.failed_tickers = []  # Reset failed tickers
+        results = []  # Collect results for summary
         for ticker in self.tickers:
-            df = self.fetch_stock_data(ticker)
-            if df is None:
-                continue
-            df = self.calculate_advanced_indicators(df)
-            signal_trend = self.strategy_trend_following(df)
-            signal_mean = self.strategy_mean_reversion(df)
-            signal_breakout = self.strategy_breakout(df)
-            signal_ml = self.get_ml_signal(df)
-            signals = [signal_trend, signal_mean, signal_breakout, signal_ml]
-            final_signal = max(set(signals), key=signals.count)
-            self.update_portfolio(ticker, final_signal)
-            sentiment_news = self.get_news_sentiment(ticker)
-            backtest_trend = self.backtest_strategy(df, self.strategy_trend_following)
-            backtest_mean = self.backtest_strategy(df, self.strategy_mean_reversion)
-            backtest_breakout = self.backtest_strategy(df, self.strategy_breakout)
-            logger.info(f"Backtest for {ticker}: Trend {backtest_trend}, Mean {backtest_mean}, Breakout {backtest_breakout}")
-            message = (
-                f"*{ticker}*\n"
-                f"Signal: {final_signal} (ML: {signal_ml})\n"
-                f"Trend: {signal_trend}, Mean: {signal_mean}, Breakout: {signal_breakout}\n"
-                f"News Sentiment: {sentiment_news:.2f}\n"
-                f"Backtest: Trend {backtest_trend['Total_Return']:.2f}, Mean {backtest_mean['Total_Return']:.2f}, "
-                f"Breakout {backtest_breakout['Total_Return']:.2f}"
-            )
-            self.send_telegram_message(message)
-            self.visualize_signals(df, ticker)
-            time.sleep(0.1)  # Tiny delay to avoid overwhelming yfinance/NewsAPI
+            try:
+                df = self.fetch_stock_data(ticker)
+                if df is None:
+                    continue
+                df = self.calculate_advanced_indicators(df)
+                if df is None:
+                    self.failed_tickers.append(ticker)
+                    continue
+                signal_trend = self.strategy_trend_following(df)
+                signal_mean = self.strategy_mean_reversion(df)
+                signal_breakout = self.strategy_breakout(df)
+                signal_ml = self.get_ml_signal(df)
+                signals = [signal_trend, signal_mean, signal_breakout, signal_ml]
+                final_signal = max(set(signals), key=signals.count)
+                self.update_portfolio(ticker, final_signal)
+                sentiment_news = self.get_news_sentiment(ticker)
+                backtest_trend = self.backtest_strategy(df, self.strategy_trend_following)
+                backtest_mean = self.backtest_strategy(df, self.strategy_mean_reversion)
+                backtest_breakout = self.backtest_strategy(df, self.strategy_breakout)
+                # Log details for each ticker
+                logger.info(
+                    f"Processing {ticker}:\n"
+                    f"  Signal: {final_signal} (ML: {signal_ml})\n"
+                    f"  Trend: {signal_trend}, Mean: {signal_mean}, Breakout: {signal_breakout}\n"
+                    f"  News Sentiment: {sentiment_news:.2f}\n"
+                    f"  Backtest: Trend {backtest_trend['Total_Return']:.2f} (Win: {backtest_trend['Win_Rate']:.2f}), "
+                    f"Mean {backtest_mean['Total_Return']:.2f} (Win: {backtest_mean['Win_Rate']:.2f}), "
+                    f"Breakout {backtest_breakout['Total_Return']:.2f} (Win: {backtest_breakout['Win_Rate']:.2f})"
+                )
+                # Send Telegram message
+                message = (
+                    f"*{ticker}*\n"
+                    f"Signal: {final_signal} (ML: {signal_ml})\n"
+                    f"Trend: {signal_trend}, Mean: {signal_mean}, Breakout: {signal_breakout}\n"
+                    f"News Sentiment: {sentiment_news:.2f}\n"
+                    f"Backtest: Trend {backtest_trend['Total_Return']:.2f}, Mean {backtest_mean['Total_Return']:.2f}, "
+                    f"Breakout {backtest_breakout['Total_Return']:.2f}"
+                )
+                self.send_telegram_message(message)
+                # Collect result for summary
+                result = {
+                    'Ticker': ticker,
+                    'Final_Signal': final_signal,
+                    'ML_Signal': signal_ml,
+                    'Trend_Signal': signal_trend,
+                    'Mean_Signal': signal_mean,
+                    'Breakout_Signal': signal_breakout,
+                    'News_Sentiment': sentiment_news,
+                    'Backtest_Trend': backtest_trend['Total_Return'],
+                    'Backtest_Mean': backtest_mean['Total_Return'],
+                    'Backtest_Breakout': backtest_breakout['Total_Return']
+                }
+                results.append(result)
+                self.visualize_signals(df, ticker)
+                time.sleep(0.1)  # Tiny delay to avoid overwhelming yfinance/NewsAPI
+            except Exception as e:
+                logger.error(f"Error processing {ticker}: {e}")
+                self.failed_tickers.append(ticker)
+        # Create and save summary
+        if results:
+            results_df = pd.DataFrame(results)
+            summary = results_df.to_string(index=False)
+            logger.info(f"Run Summary:\n{summary}")
+            self.send_telegram_message(f"*Run Summary*\n```\n{summary}\n```")
+            # Save summary to CSV
+            results_df.to_csv('trading_bot_summary.csv', index=False)
+            logger.info("Summary saved to trading_bot_summary.csv")
+        if self.failed_tickers:
+            logger.info(f"Failed tickers during run: {self.failed_tickers}")
+            self.send_telegram_message(f"*Failed Tickers*\n{self.failed_tickers}")
         logger.info("Single run completed.")
 
     def run_forever(self):
