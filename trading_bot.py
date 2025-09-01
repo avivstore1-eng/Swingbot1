@@ -76,7 +76,8 @@ class AdvancedSwingTradingBot:
 
     # ----------------- Ticker Management -----------------
     def load_tickers(self) -> List[str]:
-        # For testing, use only a few tickers
+        # Define blacklist for problematic tickers
+        blacklist = ['ANSS']  # Add known problematic tickers
         test_tickers = ['AAPL', 'MSFT', 'GOOGL']
         default_tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META']
         
@@ -90,21 +91,28 @@ class AdvancedSwingTradingBot:
                     tickers = data
                 else:
                     raise ValueError("tickers.json must contain a list or an object with 'tickers' key")
-                if not all(isinstance(t, str) for t in tickers):
-                    raise ValueError("All items in tickers.json must be strings")
-                if not tickers:
-                    raise ValueError("tickers.json is empty")
-                # Limit to 10 tickers for testing
-                tickers = tickers[:10]
-                logger.info(f"Loaded {len(tickers)} tickers from tickers.json: {tickers[:5]}{'...' if len(tickers) > 5 else ''}")
-                return tickers
+                
+                # Validate tickers: must be non-empty strings, valid format (alphanumeric + dots, max 10 chars)
+                valid_tickers = [
+                    t for t in tickers
+                    if isinstance(t, str) and t.strip() and len(t.strip()) <= 10 and t not in blacklist and t.isascii()
+                ]
+                
+                if not valid_tickers:
+                    raise ValueError("No valid tickers found in tickers.json after filtering")
+                
+                logger.info(f"Loaded {len(valid_tickers)} valid tickers from tickers.json: {valid_tickers[:5]}{'...' if len(valid_tickers) > 5 else ''}")
+                logger.info(f"Skipped {len(tickers) - len(valid_tickers)} invalid or blacklisted tickers")
+                return valid_tickers
             except json.JSONDecodeError as e:
                 logger.error(f"Invalid JSON format in tickers.json: {e}. Using default tickers")
+                return default_tickers
             except Exception as e:
                 logger.error(f"Error loading tickers.json: {e}. Using default tickers")
+                return default_tickers
         else:
             logger.warning("tickers.json not found. Using test tickers")
-        return test_tickers
+            return test_tickers
 
     # ----------------- Check NYSE Trading Hours -----------------
     def is_nyse_open(self) -> bool:
@@ -152,7 +160,7 @@ class AdvancedSwingTradingBot:
         for attempt in range(3):
             try:
                 stock = yf.Ticker(ticker)
-                data = stock.history(period=period, interval=interval, timeout=15)  # Increased timeout
+                data = stock.history(period=period, interval=interval, timeout=15)
                 if data.empty or len(data) < 50:
                     logger.warning(f"Insufficient data for {ticker} (rows: {len(data)})")
                     return None
@@ -171,7 +179,7 @@ class AdvancedSwingTradingBot:
             except Exception as e:
                 logger.error(f"Attempt {attempt+1}/3 failed for {ticker}: {e}")
                 if attempt < 2:
-                    time.sleep(10)
+                    time.sleep(15)  # Increased to 15s to avoid rate-limiting
                 else:
                     logger.error(f"All attempts failed for {ticker}")
                     return None
@@ -333,7 +341,7 @@ class AdvancedSwingTradingBot:
         all_features = pd.DataFrame()
         all_targets = pd.Series(dtype='int64')
         self.failed_tickers = []
-        training_tickers = random.sample(self.tickers, min(10, len(self.tickers)))  # Reduced for testing
+        training_tickers = random.sample(self.tickers, min(25, len(self.tickers)))  # Increased to 25
         logger.info(f"Training ML model on {len(training_tickers)} tickers")
         for ticker in training_tickers:
             logger.info(f"Processing ticker {ticker} for ML training")
@@ -361,7 +369,7 @@ class AdvancedSwingTradingBot:
             self.scaler.fit(X_train)
             X_train_scaled = self.scaler.transform(X_train)
             X_test_scaled = self.scaler.transform(X_test)
-            self.model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=3, random_state=42, eval_metric='logloss')  # Reduced n_estimators
+            self.model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=3, random_state=42, eval_metric='logloss')
             self.model.fit(X_train_scaled, y_train)
             train_score = self.model.score(X_train_scaled, y_train)
             test_score = self.model.score(X_test_scaled, y_test)
@@ -614,12 +622,9 @@ class AdvancedSwingTradingBot:
     # ----------------- Full Strategy -----------------
     def run_full_strategy(self):
         results = []
-        # Use only 1 worker to avoid GitHub Actions limitations
-        max_workers = 1
-        logger.info(f"Using {max_workers} processes for multiprocessing")
         self.failed_tickers = []
+        logger.info(f"Processing {len(self.tickers)} tickers sequentially")
         
-        # Process tickers sequentially instead of parallel
         for ticker in self.tickers:
             logger.info(f"Processing {ticker}")
             result = self.process_ticker(ticker)
@@ -672,10 +677,9 @@ class AdvancedSwingTradingBot:
     # ----------------- Single Run with Latest Data -----------------
     def run_single_run_with_latest_data(self):
         results = []
-        sample_tickers = random.sample(self.tickers, min(5, len(self.tickers)))  # Reduced for testing
+        sample_tickers = random.sample(self.tickers, min(15, len(self.tickers)))  # Increased to 15
         logger.info(f"Processing {len(sample_tickers)} tickers for single run")
         
-        # Process sequentially
         for ticker in sample_tickers:
             logger.info(f"Processing {ticker}")
             result = self.process_ticker(ticker)
