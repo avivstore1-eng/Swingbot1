@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Advanced Swing Trading Bot – גרסת 9.4/10 (חינמי) בעברית – FIXED
+Advanced Swing Trading Bot – גרסת 9.4/10 (חינמי) בעברית
 - ריצה מלאה על *כל* הטיקרים (גם שוק פתוח וגם סגור)
-- ML עם TimeSeriesSplit + EarlyStopping (XGBoost 3.x callbacks)
+- ML עם TimeSeriesSplit + EarlyStopping (תמיכה דינמית בגרסאות xgboost)
 - Persist לקול־דאון בין ריצות (JSON)
 - Backtest רב־יומי עם עלויות + דוח חודשי (CSV + גרף)
 - פילטר מצב־שוק (SPY), סינון נזילות/מחיר, דירוג EV
@@ -19,6 +19,7 @@ import pickle
 import random
 import hashlib
 import logging
+import inspect
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
@@ -38,6 +39,7 @@ from sklearn.preprocessing import StandardScaler
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# אפשר להשאיר - שימושי להשוואות גרסאות (לא חובה בכל מסלול)
 from packaging import version as _pkg_version
 
 # ===================== תצורה גלובלית =====================
@@ -78,7 +80,6 @@ logging.basicConfig(
     handlers=[logging.FileHandler("trading_bot.log"), logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
-# הורדת רעש של yfinance
 logging.getLogger("yfinance").setLevel(logging.WARNING)
 
 
@@ -132,7 +133,7 @@ def load_tickers() -> List[str]:
             logger.info(f"נטענו {len(tickers)} טיקרים מ-tickers.json.")
             return tickers
         except Exception as e:
-            logger.error(f"שגיאה בקריאת tickers.json: {e}. משתמש בברירת מחדל.")
+            logger.error(f"שגיאה בקריאת tickers.json: {e}. משתמש ברירת מחדל.")
             return default_tickers
     else:
         logger.warning("tickers.json לא נמצא. משתמש ברשימת בדיקה.")
@@ -374,6 +375,7 @@ def fetch_stock_data(ticker: str, period: str = "6mo", interval: str = "1d") -> 
                     try:
                         with open(cache_file, "wb") as f:
                             pickle.dump(obj, f)
+                        # הצלחה -> אין צורך להמשיך
                     except Exception as e:
                         logger.warning(f"שגיאת שמירת קאש עבור {ticker}: {e}")
                     return df
@@ -458,7 +460,8 @@ def prepare_ml_dataset(df: pd.DataFrame):
 
 
 def load_or_train_model(tickers: List[str]):
-    """שומר/טוען מודל כדי לחסוך זמן ב-CI. אימון על *כל* הטיקרים (חינמי) עם TimeSeriesSplit."""
+    """שומר/טוען מודל כדי לחסוך זמן ב-CI. אימון על *כל* הטיקרים (חינמי) עם TimeSeriesSplit.
+       כולל זיהוי-יכולות דינמי ל-xgboost.fit (callbacks / early_stopping_rounds)."""
     model = None
     scaler = None
 
@@ -506,11 +509,14 @@ def load_or_train_model(tickers: List[str]):
     best_score = -1e9
     best_scaler = None
 
-    use_callbacks = True
+    # בדיקת אילו פרמטרים נתמכים בפועל על-ידי fit()
     try:
-        use_callbacks = _pkg_version.parse(xgb.__version__) >= _pkg_version.parse("2.0.0")
+        fit_sig = inspect.signature(xgb.XGBClassifier.fit)
+        supports_callbacks = "callbacks" in fit_sig.parameters
+        supports_esr = "early_stopping_rounds" in fit_sig.parameters
     except Exception:
-        use_callbacks = True
+        supports_callbacks = False
+        supports_esr = False
 
     for fold, (train_idx, test_idx) in enumerate(tscv.split(all_X), start=1):
         X_train, X_test = all_X.iloc[train_idx], all_X.iloc[test_idx]
@@ -521,36 +527,44 @@ def load_or_train_model(tickers: List[str]):
         X_test_s  = scaler.transform(X_test)
 
         model = xgb.XGBClassifier(
-            n_estimators=200,
+            n_estimators=220,            # מעט יותר עצים כדי לפצות אם אין EarlyStopping
             learning_rate=0.07,
             max_depth=4,
             subsample=0.9,
             colsample_bytree=0.9,
             random_state=42 + fold,
             n_jobs=2,
-            eval_metric="logloss"  # חשוב: בתוך ה-Ctor (XGB 3.x)
+            eval_metric="logloss"       # להציב בקונסטרקטור – נתמך בכל הגרסאות המודרניות
         )
 
-        eval_set = [(X_test_s, y_test)]
-        if use_callbacks:
-            callbacks = [xgb.callback.EarlyStopping(
-                rounds=30,
-                metric_name="logloss",
-                data_name="validation_0",
-                save_best=True
-            )]
-            model.fit(
-                X_train_s, y_train,
-                eval_set=eval_set,
-                callbacks=callbacks,
-                verbose=False
-            )
-        else:
-            model.fit(
-                X_train_s, y_train,
-                eval_set=eval_set,
-                verbose=False
-            )
+        fit_kwargs = {
+            "eval_set": [(X_test_s, y_test)],
+            "verbose": False
+        }
+
+        # אם הגרסה תומכת ב-early_stopping_rounds – נשתמש בו
+        if supports_esr:
+            fit_kwargs["early_stopping_rounds"] = 30
+
+        # אם הגרסה תומכת ב-callbacks – נשתמש ב-EarlyStopping (xgboost >= 2.0)
+        if supports_callbacks:
+            try:
+                cb = xgb.callback.EarlyStopping(
+                    rounds=30,
+                    metric_name="logloss",
+                    data_name="validation_0",
+                    save_best=True
+                )
+                fit_kwargs["callbacks"] = [cb]
+            except Exception:
+                pass
+
+        try:
+            model.fit(X_train_s, y_train, **fit_kwargs)
+        except TypeError as te:
+            # אם חרף הזיהוי עדיין נפל – ננסה ללא callbacks / ESR
+            logger.warning(f"ניסיון fit ללא פרמטרים מתקדמים בעקבות TypeError: {te}")
+            model.fit(X_train_s, y_train, eval_set=[(X_test_s, y_test)], verbose=False)
 
         fold_score = model.score(X_test_s, y_test)
         logger.info(f"XGB TSCV fold {fold}: Test={fold_score:.3f}")
@@ -596,10 +610,8 @@ def strategy_mean_reversion(df: pd.DataFrame) -> str:
         if len(df) < 50:
             return "HOLD"
         latest = df.iloc[-1]
-        # קנייה במצב "מכירת יתר" עם ADX>20
         if latest["RSI"] < 30 and latest["Close"] < latest["BB_Lower"] and latest["ADX"] > 20:
             return "BUY"
-        # מכירה במצב "קניית יתר" עם ADX>20
         if latest["RSI"] > 70 and latest["Close"] > latest["BB_Upper"] and latest["ADX"] > 20:
             return "SELL"
         return "HOLD"
@@ -670,7 +682,7 @@ def passes_liquidity_filter(df: pd.DataFrame) -> bool:
         return False
 
 
-# ===================== Backtest מתקדם + דירוג EV =====================
+# ===================== Backtest + דירוג EV =====================
 
 def backtest_day_ahead(df: pd.DataFrame, strategy_func) -> Dict[str, float]:
     """
@@ -711,9 +723,9 @@ def backtest_day_ahead(df: pd.DataFrame, strategy_func) -> Dict[str, float]:
 def backtest_multiday_with_costs(df: pd.DataFrame, strategy_func, hold_days: int = 5,
                                  commission_bps: float = 5.0, slippage_bps: float = 5.0) -> Dict[str, float]:
     """
-    Backtest רב-יומי עם עלויות:
-    - hold_days: מספר ימי החזקה לאחר איתות (ללא re-entry באמצע)
-    - commission_bps/slippage_bps: עלויות דו-צדדיות (קניה+מכירה), Basis Points (1/100%)
+    Backtest רב-יומי עם עלויות (דו-צדדי: ק/מ):
+    - hold_days: מספר ימי החזקה לאחר איתות
+    - commission_bps/slippage_bps: Basis Points (1/100%)
     מחזיר: Equity curve, WinRate, Avg trade, EV, MaxDD, Sharpe גס.
     """
     try:
