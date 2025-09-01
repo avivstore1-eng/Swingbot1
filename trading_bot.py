@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Advanced Swing Trading Bot – גרסת 9.4/10 (חינמי) בעברית
+Advanced Swing Trading Bot – גרסת 9.4/10 (חינמי) בעברית – FIXED
 - ריצה מלאה על *כל* הטיקרים (גם שוק פתוח וגם סגור)
 - ML עם TimeSeriesSplit + EarlyStopping (XGBoost 3.x callbacks)
 - Persist לקול־דאון בין ריצות (JSON)
 - Backtest רב־יומי עם עלויות + דוח חודשי (CSV + גרף)
 - פילטר מצב־שוק (SPY), סינון נזילות/מחיר, דירוג EV
 - ATR sizing, Trailing Stop, חשיפת פורטפוליו דינמית, Cooldown
-- מקביליות + קאש יומי + Backoff ל־yfinance
+- מקביליות + קאש יומי + Backoff ל-yfinance
 - התראות טלגרם בעברית (אופציונלי)
 """
 
@@ -42,50 +42,44 @@ from packaging import version as _pkg_version
 
 # ===================== תצורה גלובלית =====================
 
-# כופה ניתוח מלא תמיד (גם כשהשוק סגור)
 FORCE_ANALYSIS_WHEN_CLOSED = True
 
-# הון וירטואלי (לדמו/סימולציה של גודל עסקה)
-EQUITY = float(os.getenv("EQUITY", "100000"))                 # ברירת מחדל: 100K$
+EQUITY = float(os.getenv("EQUITY", "100000"))                 # הון לדמו: 100K$
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))   # 1% סיכון לעסקה
-COOLDOWN_DAYS = int(os.getenv("COOLDOWN_DAYS", "2"))          # מניעת היפוך מהיר
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))              # מקביליות ל-yfinance
+COOLDOWN_DAYS = int(os.getenv("COOLDOWN_DAYS", "2"))          # קירור היפוך 2 ימים
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))              # מקביליות
 MAX_EXPOSURE = float(os.getenv("MAX_EXPOSURE", "0.6"))        # עד 60% הון בפוזיציות
 
-# קבצים
 MODEL_PATH = "model.pkl"
 SCALER_PATH = "scaler.pkl"
 CACHE_PREFIX = "cache_"
 RESULTS_CSV = "trading_bot_summary.csv"
 RESULTS_CSV_LIMITED = "trading_bot_summary_limited.csv"
 
-# Persist state
 PERSIST_DIR = ".trading_cache"
 os.makedirs(PERSIST_DIR, exist_ok=True)
 COOLDOWN_FILE = os.path.join(PERSIST_DIR, "cooldown_state.json")
 
-# טלגרם (אופציונלי; חינמי)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# שחזוריות
 random.seed(42)
 np.random.seed(42)
 
-# נסה xgboost (חינמי). אם חסר—הבוט ממשיך בלי ML.
 try:
     import xgboost as xgb
     XGB_AVAILABLE = True
 except ImportError:
     XGB_AVAILABLE = False
 
-# לוגים
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[logging.FileHandler("trading_bot.log"), logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
+# הורדת רעש של yfinance
+logging.getLogger("yfinance").setLevel(logging.WARNING)
 
 
 # ===================== עזר =====================
@@ -108,24 +102,35 @@ def send_telegram_message(message: str):
 
 
 def load_tickers() -> List[str]:
-    """טעינת טיקרים מ-tickers.json (או ברירת מחדל)."""
-    blacklist = {"ANSS"}  # דוגמה לטיקר בעייתי; ניתן להסיר
+    """טעינת טיקרים מ-tickers.json (ניקוי סימנים בעייתיים, כפילויות, תווים)."""
+    blacklist = {"ANSS"}
     test_tickers = ["AAPL", "MSFT", "GOOGL"]
     default_tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "META"]
+
+    def _clean(sym: str) -> Optional[str]:
+        if not isinstance(sym, str):
+            return None
+        s = sym.strip().upper().replace(" ", "")
+        if s.startswith("$"):
+            s = s[1:]
+        import re
+        if not re.fullmatch(r"[A-Z0-9\.-]{1,10}", s):
+            return None
+        if s in blacklist:
+            return None
+        return s
 
     if os.path.exists("tickers.json"):
         try:
             with open("tickers.json", "r", encoding="utf-8") as f:
                 data = json.load(f)
-            tickers = data.get("tickers", data) if isinstance(data, dict) else data
-            valid = []
-            for t in tickers:
-                if isinstance(t, str) and t.strip() and len(t.strip()) <= 10 and t.isascii() and t not in blacklist:
-                    valid.append(t.strip().upper())
-            if not valid:
+            raw = data.get("tickers", data) if isinstance(data, dict) else data
+            cleaned = {_clean(t) for t in raw}
+            tickers = sorted([t for t in cleaned if t])
+            if not tickers:
                 raise ValueError("לא נמצאו טיקרים תקינים.")
-            logger.info(f"נטענו {len(valid)} טיקרים מ-tickers.json.")
-            return valid
+            logger.info(f"נטענו {len(tickers)} טיקרים מ-tickers.json.")
+            return tickers
         except Exception as e:
             logger.error(f"שגיאה בקריאת tickers.json: {e}. משתמש בברירת מחדל.")
             return default_tickers
@@ -358,7 +363,6 @@ def fetch_stock_data(ticker: str, period: str = "6mo", interval: str = "1d") -> 
             except Exception as e:
                 logger.warning(f"שגיאת טעינת קאש עבור {ticker}: {e}")
 
-        # עד 3 ניסיונות עם backoff
         delay = 1.0
         last_exc = None
         for _ in range(3):
@@ -379,7 +383,7 @@ def fetch_stock_data(ticker: str, period: str = "6mo", interval: str = "1d") -> 
                 last_exc = e
                 logger.warning(f"שגיאת רשת/Rate עבור {ticker}, נסיון נוסף בעוד {delay:.1f}s: {e}")
                 time.sleep(delay)
-                delay *= 2  # backoff
+                delay *= 2
 
         if last_exc:
             logger.error(f"כשל סופי בשליפת נתונים ל-{ticker}: {last_exc}")
@@ -458,7 +462,6 @@ def load_or_train_model(tickers: List[str]):
     model = None
     scaler = None
 
-    # נסה לטעון מודל שמור
     if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH) and XGB_AVAILABLE:
         try:
             with open(MODEL_PATH, "rb") as f:
@@ -475,7 +478,6 @@ def load_or_train_model(tickers: List[str]):
         logger.error("xgboost חסר. ML יושבת.")
         return None, StandardScaler()
 
-    # אימון על כל הטיקרים
     training_tickers = tickers
     logger.info(f"אימון ML על {len(training_tickers)} טיקרים...")
 
@@ -499,7 +501,6 @@ def load_or_train_model(tickers: List[str]):
         logger.warning("אין מספיק נתונים לאימון ML.")
         return None, StandardScaler()
 
-    # אימות-זמן: TimeSeriesSplit + EarlyStopping (callbacks ל-XGB >= 2.0)
     tscv = TimeSeriesSplit(n_splits=5)
     best_model = None
     best_score = -1e9
@@ -527,6 +528,7 @@ def load_or_train_model(tickers: List[str]):
             colsample_bytree=0.9,
             random_state=42 + fold,
             n_jobs=2,
+            eval_metric="logloss"  # חשוב: בתוך ה-Ctor (XGB 3.x)
         )
 
         eval_set = [(X_test_s, y_test)]
@@ -540,17 +542,13 @@ def load_or_train_model(tickers: List[str]):
             model.fit(
                 X_train_s, y_train,
                 eval_set=eval_set,
-                eval_metric="logloss",
                 callbacks=callbacks,
                 verbose=False
             )
         else:
-            # תאימות אחורה אם צריך (נדיר ב-2025)
             model.fit(
                 X_train_s, y_train,
                 eval_set=eval_set,
-                eval_metric="logloss",
-                early_stopping_rounds=30,
                 verbose=False
             )
 
@@ -598,8 +596,10 @@ def strategy_mean_reversion(df: pd.DataFrame) -> str:
         if len(df) < 50:
             return "HOLD"
         latest = df.iloc[-1]
+        # קנייה במצב "מכירת יתר" עם ADX>20
         if latest["RSI"] < 30 and latest["Close"] < latest["BB_Lower"] and latest["ADX"] > 20:
             return "BUY"
+        # מכירה במצב "קניית יתר" עם ADX>20
         if latest["RSI"] > 70 and latest["Close"] > latest["BB_Upper"] and latest["ADX"] > 20:
             return "SELL"
         return "HOLD"
@@ -732,12 +732,10 @@ def backtest_multiday_with_costs(df: pd.DataFrame, strategy_func, hold_days: int
                 i += 1
                 continue
 
-            # כניסה בסגירה של היום i (בקירוב), הוספת עלויות:
             entry = df["Close"].iloc[i]
             entry_cost = entry * (commission_bps + slippage_bps) / 10000.0
             entry_effective = entry + entry_cost if side == 1 else entry - entry_cost
 
-            # יציאה אחרי hold_days או סוף דאטה:
             exit_idx = min(i + hold_days, len(df) - 1)
             exit_price = df["Close"].iloc[exit_idx]
             exit_cost = exit_price * (commission_bps + slippage_bps) / 10000.0
@@ -746,10 +744,7 @@ def backtest_multiday_with_costs(df: pd.DataFrame, strategy_func, hold_days: int
             trade_ret = (exit_effective / entry_effective - 1.0) * side
             pnl_trades.append(trade_ret)
 
-            # עדכון equity (מצטבר)
             equity.append(equity[-1] * (1.0 + trade_ret))
-
-            # דילוג עד היציאה (אין re-entry באמצע)
             i = exit_idx + 1
 
         if not pnl_trades:
@@ -761,13 +756,11 @@ def backtest_multiday_with_costs(df: pd.DataFrame, strategy_func, hold_days: int
         avg_neg = float((-s[s < 0]).mean()) if (s < 0).any() else 0.0
         ev = win_rate * avg_pos - (1 - win_rate) * avg_neg
 
-        # Max Drawdown
         eq = pd.Series(equity)
         peak = eq.cummax()
         dd = (eq / peak - 1.0).min()
         maxdd = float(abs(dd))
 
-        # Sharpe גס (יומי): ממוצע תשואות / סטיית תקן (ללא RF)
         rets = eq.pct_change().dropna()
         sharpe = float(rets.mean() / (rets.std() + 1e-9) * np.sqrt(252)) if not rets.empty else 0.0
 
@@ -782,10 +775,7 @@ def monthly_backtest_report(tickers: List[str], hold_days: int = 5,
                             commission_bps: float = 5.0, slippage_bps: float = 5.0,
                             out_csv: str = "monthly_backtest_report.csv",
                             out_png: str = "monthly_equity_curve.png"):
-    """
-    מריץ backtest רב-יומי עם עלויות על כלל הטיקרים ומפיק דוח חודשי גס.
-    - מחבר Equity ממוצע (לא שקלול לפי שווי שוק) לצורך עקומה כללית.
-    """
+    """מריץ backtest רב-יומי על כלל הטיקרים ומפיק דוח חודשי גס."""
     rows = []
     all_equities = []
     for t in tickers:
@@ -832,19 +822,16 @@ def weighted_score(row: pd.Series) -> float:
     return 0.8 * float(row.get("Best_EV", 0.0)) + 0.2 * float(row.get("Best_WinRate", 0.0))
 
 
-# ===================== ניהול פוזיציה: ATR Sizing + Trailing =====================
+# ===================== ניהול פוזיציה =====================
 
 def position_size_by_atr(entry_price: float, atr: float) -> int:
-    """
-    גודל פוזיציה לפי סיכון קבוע: כמה מניות כדי לסכן ~RISK_PER_TRADE מההון כאשר סטופ=ATR אחד.
-    """
+    """גודל פוזיציה לפי סיכון קבוע (ATR = סטופ)."""
     if entry_price <= 0 or atr <= 0:
         return 0
     risk_dollars = EQUITY * RISK_PER_TRADE
     per_share_risk = atr
     shares = int(max(0, risk_dollars // per_share_risk))
-    # אל תגזים: לא יותר מ-20% הון לפוזיציה
-    max_shares_by_cap = int((EQUITY * 0.2) // entry_price)
+    max_shares_by_cap = int((EQUITY * 0.2) // entry_price)  # לא יותר מ-20% הון לפוזיציה
     return max(0, min(shares, max_shares_by_cap))
 
 
@@ -859,7 +846,6 @@ def trailing_stop_levels(entry: float, atr: float, side: str, multiple: float = 
     return entry
 
 
-# מעקב אחר איתות אחרון לטיקר (למנגנון COOLDOWN) + Persist JSON
 _last_signal_date: Dict[str, Dict[str, datetime]] = {}
 _persist_cooldown_raw = _load_cooldown_state()
 for _tkr, _m in _persist_cooldown_raw.items():
@@ -952,7 +938,6 @@ class AdvancedSwingTradingBot:
 
     def update_portfolio(self, ticker: str, signal: str):
         try:
-            # בדיקת חשיפה גסה: מספר פוזיציות * 20% הון (כי sizing מגביל ל-20% לפוזיציה)
             pos_count = sum(1 for p in self.portfolio.values() if p.get("position", 0) != 0)
             approx_exposure = min(1.0, pos_count * 0.2)
             if approx_exposure >= MAX_EXPOSURE and signal in ("BUY", "SELL"):
@@ -978,7 +963,6 @@ class AdvancedSwingTradingBot:
                 self.failed_tickers.append(ticker)
                 return None
 
-            # סינון נזילות/מחיר – מפחית רעש
             if not passes_liquidity_filter(df):
                 return None
 
@@ -990,13 +974,11 @@ class AdvancedSwingTradingBot:
             signals = [s_trend, s_mean, s_break, s_ml]
             final_signal = vote_final_signal(signals)
 
-            # פילטר מצב שוק: לא לונגים כש-SPY חלש, לא שורטים כש-SPY חזק
             if final_signal == "BUY" and not market_regime_long_allowed():
                 final_signal = "HOLD"
             if final_signal == "SELL" and not market_regime_short_allowed():
                 final_signal = "HOLD"
 
-            # Backtests + EV
             bt_trend = backtest_day_ahead(df, strategy_func=strategy_trend_following)
             bt_mean  = backtest_day_ahead(df, strategy_func=strategy_mean_reversion)
             bt_break = backtest_day_ahead(df, strategy_func=strategy_breakout)
@@ -1004,7 +986,6 @@ class AdvancedSwingTradingBot:
             best_ev = max(bt_trend["EV"], bt_mean["EV"], bt_break["EV"])
             best_wr = max(bt_trend["Win_Rate"], bt_mean["Win_Rate"], bt_break["Win_Rate"])
 
-            # קירור אותות – מניעת היפוך מהיר (Persist בין ריצות)
             today = datetime.utcnow().date()
             ls = _last_signal_date.get(ticker, {})
             if final_signal in ("BUY", "SELL"):
@@ -1077,7 +1058,6 @@ class AdvancedSwingTradingBot:
         df = pd.DataFrame(results)
         df["Weighted_Score"] = df.apply(weighted_score, axis=1)
 
-        # בחר טופ רק עם EV חיובי וסיגנל פעיל
         picks = df[(df["Final_Signal"] != "HOLD") & (df["Best_EV"] > 0)].copy()
         top = picks.sort_values("Weighted_Score", ascending=False).head(5)
 
@@ -1096,14 +1076,14 @@ class AdvancedSwingTradingBot:
             market_status = "פתוחה" if is_nyse_open_now() else "סגורה – משתמש בנתונים העדכניים האחרונים"
             msg = f"*5 הבחירות המובילות ל-{datetime.utcnow().date()}*\n" \
                   f"*סטטוס שוק*: NYSE {market_status}\n" \
-                  f"*EV ממוצע*: {avg_ev*100:.2f}‰  (אחוזים אלפיים לטרייד)\n" \
+                  f"*EV ממוצע*: {avg_ev*100:.2f}%\n" \
                   f"*Win Rate ממוצע (Backtest)*: {avg_wr*100:.1f}%\n\n"
             for i, (_, row) in enumerate(top.iterrows(), start=1):
                 msg += (
                     f"{i}. *{row['Ticker']}* — *{row['Final_Signal']}*\n"
                     f"   כניסה: ${row['Entry_Price']:.2f} | גודל מומלץ: {int(row['Size'])} מניות\n"
                     f"   TP: ${row['Take_Profit']:.2f} | SL: ${row['Stop_Loss']:.2f} | Trailing: ${row['Trailing_Stop']:.2f}\n"
-                    f"   EV: {row['Best_EV']*100:.2f}‰ | WinRate: {row['Best_WinRate']*100:.1f}%\n\n"
+                    f"   EV: {row['Best_EV']*100:.2f}% | WinRate: {row['Best_WinRate']*100:.1f}%\n\n"
                 )
             send_telegram_message(msg)
         else:
@@ -1112,7 +1092,6 @@ class AdvancedSwingTradingBot:
         df.to_csv(RESULTS_CSV, index=False)
         logger.info(f"נשמר סיכום ל-{RESULTS_CSV}")
 
-        # הפקת דוח חודשי גס (חינמי)
         try:
             monthly_backtest_report(self.tickers, hold_days=5, commission_bps=5.0, slippage_bps=5.0)
         except Exception as e:
@@ -1122,7 +1101,7 @@ class AdvancedSwingTradingBot:
             send_telegram_message(f"*טיקרים שנכשלו בעיבוד*\n{self.failed_tickers[:50]}{'...' if len(self.failed_tickers) > 50 else ''}")
 
     def run_single_run(self):
-        """גם 'מצומצם' ירוץ על *כל* הטיקרים – לשקיפות והתנהגות אחידה."""
+        """מצומצם – עדיין על כל הטיקרים לשקיפות."""
         results = []
         self.failed_tickers = []
 
@@ -1151,7 +1130,7 @@ class AdvancedSwingTradingBot:
                     f"{i}. *{row['Ticker']}* — *{row['Final_Signal']}*\n"
                     f"   כניסה: ${row['Entry_Price']:.2f} | גודל מומלץ: {int(row['Size'])} מניות\n"
                     f"   TP: ${row['Take_Profit']:.2f} | SL: ${row['Stop_Loss']:.2f} | Trailing: ${row['Trailing_Stop']:.2f}\n"
-                    f"   EV: {row['Best_EV']*100:.2f}‰ | WinRate: {row['Best_WinRate']*100:.1f}%\n\n"
+                    f"   EV: {row['Best_EV']*100:.2f}% | WinRate: {row['Best_WinRate']*100:.1f}%\n\n"
                 )
             send_telegram_message(msg)
         else:
@@ -1168,7 +1147,6 @@ class AdvancedSwingTradingBot:
         now_ist = datetime.now(tz_ist)
         nyse_open = is_nyse_open_now()
 
-        # טקסטים בעברית (לא בתוך ביטוי לוגי של f-string)
         status_txt = "פתוחה" if nyse_open else "סגורה"
         mode = (
             "אסטרטגיה מלאה על *כל* הטיקרים (שוק פתוח)" if nyse_open
