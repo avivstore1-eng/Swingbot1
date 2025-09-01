@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Advanced Swing Trading Bot 11/10 – Optimized for Speed, Timeout Handling, Runs Anytime
+Advanced Swing Trading Bot 11/10 – Optimized for Speed, Robust Timeout, Runs Anytime
 Free, GitHub Actions ready, no TA-Lib, no external APIs, JSON tickers
 """
 
@@ -22,8 +22,7 @@ import matplotlib.pyplot as plt
 import random
 import pickle
 import hashlib
-from functools import wraps
-import signal
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 # Check for xgboost and send Telegram alert if missing
 try:
@@ -49,23 +48,6 @@ logging.basicConfig(
     handlers=[logging.FileHandler('trading_bot.log'), logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
-
-# Timeout decorator for ticker processing
-def timeout(seconds):
-    def decorator(func):
-        def _handle_timeout(signum, frame):
-            raise TimeoutError(f"Function {func.__name__} timed out after {seconds} seconds")
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            signal.signal(signal.SIGALRM, _handle_timeout)
-            signal.alarm(seconds)
-            try:
-                result = func(*args, **kwargs)
-            finally:
-                signal.alarm(0)
-            return result
-        return wrapper
-    return decorator
 
 class AdvancedSwingTradingBot:
     def __init__(self):
@@ -112,13 +94,22 @@ class AdvancedSwingTradingBot:
 
     # ----------------- Check NYSE Trading Hours -----------------
     def is_nyse_open(self) -> bool:
-        tz_ny = pytz.timezone('America/New_York')
-        now_ny = datetime.now(tz_ny)
-        if now_ny.weekday() >= 5:
+        try:
+            tz_ny = pytz.timezone('America/New_York')
+            now_ny = datetime.now(tz_ny)
+            # Check if it's a weekday (Monday=0, Sunday=6)
+            if now_ny.weekday() >= 5:
+                logger.info("NYSE closed: Weekend")
+                return False
+            # NYSE trading hours: 9:30 AM to 4:00 PM ET
+            market_open = now_ny.replace(hour=9, minute=30, second=0, microsecond=0)
+            market_close = now_ny.replace(hour=16, minute=0, second=0, microsecond=0)
+            is_open = market_open <= now_ny <= market_close
+            logger.info(f"NYSE open check: {now_ny} -> {'open' if is_open else 'closed'}")
+            return is_open
+        except Exception as e:
+            logger.error(f"Error checking NYSE hours: {e}")
             return False
-        market_open = now_ny.replace(hour=9, minute=30, second=0, microsecond=0)
-        market_close = now_ny.replace(hour=16, minute=0, second=0, microsecond=0)
-        return market_open <= now_ny <= market_close
 
     # ----------------- Fetch Data with Cache and Retries -----------------
     def fetch_stock_data(self, ticker: str, period: str = '3mo', interval: str = '1d') -> Optional[pd.DataFrame]:
@@ -167,7 +158,7 @@ class AdvancedSwingTradingBot:
             except Exception as e:
                 logger.error(f"Attempt {attempt+1}/3 failed for {ticker}: {e}")
                 if attempt < 2:
-                    time.sleep(2)  # Wait before retry
+                    time.sleep(2)
                 else:
                     logger.error(f"All attempts failed for {ticker}")
                     return None
@@ -540,7 +531,6 @@ class AdvancedSwingTradingBot:
             return {"Entry_Price": 0.0, "Take_Profit": 0.0, "Stop_Loss": 0.0}
 
     # ----------------- Process Single Ticker -----------------
-    @timeout(30)  # Timeout after 30 seconds per ticker
     def process_ticker(self, ticker: str) -> Optional[Dict]:
         try:
             start_time = time.time()
@@ -562,7 +552,6 @@ class AdvancedSwingTradingBot:
             backtest_mean = self.backtest_strategy(df, self.strategy_mean_reversion)
             backtest_breakout = self.backtest_strategy(df, self.strategy_breakout)
             trade_details = self.calculate_trade_details(df, final_signal)
-            # Log only for debugging or Top 5
             result = {
                 'Ticker': ticker,
                 'Final_Signal': final_signal,
@@ -584,14 +573,25 @@ class AdvancedSwingTradingBot:
                 max(backtest_trend['Win_Rate'], backtest_mean['Win_Rate'], backtest_breakout['Win_Rate']) > 0.7):
                 logger.info(f"Processed {ticker} in {time.time() - start_time:.2f}s: Signal={final_signal}, ML={signal_ml}")
             return result
-        except TimeoutError:
-            logger.error(f"Timeout processing {ticker} after 30 seconds")
-            self.failed_tickers.append(ticker)
-            return None
         except Exception as e:
             logger.error(f"Error processing {ticker}: {e}")
             self.failed_tickers.append(ticker)
             return None
+
+    # ----------------- Process Ticker with Timeout -----------------
+    def process_ticker_with_timeout(self, ticker: str) -> Optional[Dict]:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(self.process_ticker, ticker)
+            try:
+                return future.result(timeout=30)
+            except TimeoutError:
+                logger.error(f"Timeout processing {ticker} after 30 seconds")
+                self.failed_tickers.append(ticker)
+                return None
+            except Exception as e:
+                logger.error(f"Error in process_ticker_with_timeout for {ticker}: {e}")
+                self.failed_tickers.append(ticker)
+                return None
 
     # ----------------- Run Bot -----------------
     def run_once(self):
@@ -610,10 +610,10 @@ class AdvancedSwingTradingBot:
         results = []
         
         # Parallel processing with limited processes
-        num_processes = min(cpu_count(), 4)  # Limit to 4 processes
+        num_processes = min(cpu_count(), 4)
         logger.info(f"Using {num_processes} processes for multiprocessing")
         with Pool(processes=num_processes) as pool:
-            for i, result in enumerate(pool.imap_unordered(self.process_ticker, self.tickers)):
+            for i, result in enumerate(pool.imap_unordered(self.process_ticker_with_timeout, self.tickers)):
                 if result is not None:
                     results.append(result)
                 if (i + 1) % 50 == 0:
@@ -662,7 +662,7 @@ class AdvancedSwingTradingBot:
             self.send_telegram_message(f"*Failed Tickers*\n{self.failed_tickers[:50]}{'...' if len(self.failed_tickers) > 50 else ''}")
         elapsed_time = time.time() - start_time
         logger.info(f"Single run completed in {elapsed_time:.2f}s")
-        if elapsed_time > 600:  # 10 minutes
+        if elapsed_time > 600:
             self.send_telegram_message(f"*Warning*: Bot run took {elapsed_time/60:.1f} minutes, exceeding 10 minutes. Check logs.")
 
 if __name__ == "__main__":
