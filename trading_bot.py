@@ -15,8 +15,9 @@ import logging
 import json
 from typing import Dict, List, Optional
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
+from sklearn.model_model_selection import train_test_split
 import pytz
+from multiprocessing import Pool, cpu_count
 import matplotlib.pyplot as plt
 import random
 import pickle
@@ -107,8 +108,11 @@ class AdvancedSwingTradingBot:
             market_open = now_ny.replace(hour=9, minute=30, second=0, microsecond=0)
             market_close = now_ny.replace(hour=16, minute=0, second=0, microsecond=0)
             is_open = market_open <= now_ny <= market_close
+            # Simple holiday check (Labor Day 2025 is Sep 1, Monday)
             today = now_ny.date()
-            holidays_2025 = [(9, 1)]  # Labor Day: Sep 1, 2025
+            holidays_2025 = [
+                (9, 1),  # Labor Day: Sep 1, 2025
+            ]
             if (today.month, today.day) in holidays_2025:
                 logger.info(f"NYSE closed: Holiday (Labor Day, {today})")
                 return False
@@ -124,10 +128,12 @@ class AdvancedSwingTradingBot:
         cache_file = f"cache_{cache_key}.pkl"
         current_date = datetime.now().date().isoformat()
         
+        # Check cache
         if cache_key in self.data_cache and self.data_cache[cache_key]['date'] == current_date:
             logger.info(f"Using cached data for {ticker}")
             return self.data_cache[cache_key]['data']
         
+        # Load from disk cache if exists and valid
         if os.path.exists(cache_file):
             try:
                 with open(cache_file, 'rb') as f:
@@ -139,6 +145,7 @@ class AdvancedSwingTradingBot:
             except Exception as e:
                 logger.warning(f"Error loading cache for {ticker}: {e}")
         
+        # Fetch new data with retries
         for attempt in range(3):
             try:
                 stock = yf.Ticker(ticker)
@@ -150,6 +157,7 @@ class AdvancedSwingTradingBot:
                 if not all(col in data.columns for col in required_columns):
                     logger.warning(f"Missing required columns for {ticker}: {data.columns}")
                     return None
+                # Save to cache
                 self.data_cache[cache_key] = {'date': current_date, 'data': data}
                 try:
                     with open(cache_file, 'wb') as f:
@@ -161,7 +169,7 @@ class AdvancedSwingTradingBot:
             except Exception as e:
                 logger.error(f"Attempt {attempt+1}/3 failed for {ticker}: {e}")
                 if attempt < 2:
-                    time.sleep(10)  # Increased to 10s
+                    time.sleep(10)
                 else:
                     logger.error(f"All attempts failed for {ticker}")
                     return None
@@ -326,7 +334,6 @@ class AdvancedSwingTradingBot:
         training_tickers = random.sample(self.tickers, min(100, len(self.tickers)))
         logger.info(f"Training ML model on {len(training_tickers)} tickers")
         for ticker in training_tickers:
-            logger.info(f"Processing ticker {ticker} for ML training")
             df = self.fetch_stock_data(ticker)
             if df is None:
                 self.failed_tickers.append(ticker)
@@ -538,7 +545,6 @@ class AdvancedSwingTradingBot:
     def process_ticker(self, ticker: str) -> Optional[Dict]:
         try:
             start_time = time.time()
-            logger.info(f"Starting processing for {ticker}")
             df = self.fetch_stock_data(ticker)
             if df is None:
                 self.failed_tickers.append(ticker)
@@ -585,29 +591,26 @@ class AdvancedSwingTradingBot:
 
     # ----------------- Process Ticker with Timeout -----------------
     def process_ticker_with_timeout(self, ticker: str) -> Optional[Dict]:
-        try:
-            logger.info(f"Submitting {ticker} for processing with timeout")
-            with ProcessPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(self.process_ticker, ticker)
-                result = future.result(timeout=30)
-                logger.info(f"Completed processing {ticker}")
-                return result
-        except TimeoutError:
-            logger.error(f"Timeout processing {ticker} after 30 seconds")
-            self.failed_tickers.append(ticker)
-            return None
-        except Exception as e:
-            logger.error(f"Error in process_ticker_with_timeout for {ticker}: {e}")
-            self.failed_tickers.append(ticker)
-            return None
+        with ProcessPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(self.process_ticker, ticker)
+            try:
+                return future.result(timeout=30)
+            except TimeoutError:
+                logger.error(f"Timeout processing {ticker} after 30 seconds")
+                self.failed_tickers.append(ticker)
+                return None
+            except Exception as e:
+                logger.error(f"Error in process_ticker_with_timeout for {ticker}: {e}")
+                self.failed_tickers.append(ticker)
+                return None
 
     # ----------------- Full Strategy -----------------
     def run_full_strategy(self):
         results = []
-        max_workers = min(os.cpu_count() or 4, 4)
-        logger.info(f"Using {max_workers} processes for multiprocessing")
+        num_processes = min(cpu_count(), 4)
+        logger.info(f"Using {num_processes} processes for multiprocessing")
         self.failed_tickers = []
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        with ProcessPoolExecutor(max_workers=num_processes) as executor:
             future_to_ticker = {executor.submit(self.process_ticker, ticker): ticker for ticker in self.tickers}
             processed = 0
             for future in as_completed(future_to_ticker):
@@ -674,7 +677,7 @@ class AdvancedSwingTradingBot:
         results = []
         sample_tickers = random.sample(self.tickers, min(50, len(self.tickers)))
         logger.info(f"Processing {len(sample_tickers)} tickers for single run")
-        with ProcessPoolExecutor(max_workers=min(os.cpu_count() or 4, 4)) as executor:
+        with ProcessPoolExecutor(max_workers=min(cpu_count() or 4, 4)) as executor:
             future_to_ticker = {executor.submit(self.process_ticker, ticker): ticker for ticker in sample_tickers}
             for future in as_completed(future_to_ticker):
                 ticker = future_to_ticker[future]
@@ -727,15 +730,18 @@ class AdvancedSwingTradingBot:
     def run_once(self):
         tz_ist = pytz.timezone('Asia/Jerusalem')
         now_ist = datetime.now(tz_ist)
+        is_manual_run = os.getenv('GITHUB_EVENT_NAME') == 'workflow_dispatch'
+        is_nyse_open = self.is_nyse_open()
+        market_status = "open" if is_nyse_open else "closed, using latest available data"
         start_time = time.time()
         
-        logger.info(f"Starting Advanced Swing Trading Bot - Single Run")
+        logger.info(f"Starting Advanced Swing Trading Bot - Single Run (NYSE {market_status})")
         self.send_telegram_message(
-            f"*Trading Bot*\nRun started at {now_ist}."
+            f"*Trading Bot*\nRun started at {now_ist}. NYSE is {market_status}."
         )
         self.failed_tickers = []
 
-        if self.is_nyse_open():
+        if is_nyse_open:
             logger.info("Market open – running full strategy")
             self.run_full_strategy()
         else:
