@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Advanced Swing Trading Bot – גרסת "מקסימום" בעברית (חינמי)
-- ריצה מלאה על *כל* הטיקרים תמיד (גם כשהשוק סגור)
-- אימון ML על *כל* הטיקרים אם xgboost זמין (אחרת ממשיך בלי ML)
-- סינון נזילות/מחיר, פילטר מצב שוק SPY, דירוג EV, גודל פוזיציה ATR, Trailing Stop, Cooldown
-- מקביליות בטוחה ל-500 טיקרים (ThreadPool), קאש יומי, גרפים CI-safe
-- הודעות טלגרם בעברית עם פירוט גודל פוזיציה ו-Trailing Stop
+Advanced Swing Trading Bot – גרסת 9.4/10 (חינמי) בעברית
+- ריצה מלאה על *כל* הטיקרים (גם שוק פתוח וגם סגור)
+- ML עם TimeSeriesSplit + EarlyStopping (XGBoost 3.x callbacks)
+- Persist לקול־דאון בין ריצות (JSON)
+- Backtest רב־יומי עם עלויות + דוח חודשי (CSV + גרף)
+- פילטר מצב־שוק (SPY), סינון נזילות/מחיר, דירוג EV
+- ATR sizing, Trailing Stop, חשיפת פורטפוליו דינמית, Cooldown
+- מקביליות + קאש יומי + Backoff ל־yfinance
+- התראות טלגרם בעברית (אופציונלי)
 """
 
 import os
@@ -30,10 +33,12 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from packaging import version as _pkg_version
 
 # ===================== תצורה גלובלית =====================
 
@@ -41,19 +46,23 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 FORCE_ANALYSIS_WHEN_CLOSED = True
 
 # הון וירטואלי (לדמו/סימולציה של גודל עסקה)
-EQUITY = float(os.getenv("EQUITY", "100000"))             # ברירת מחדל: 100K$
-RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))  # 1% סיכון לעסקה
-COOLDOWN_DAYS = int(os.getenv("COOLDOWN_DAYS", "2"))         # מניעת היפוך מהיר
-
-# מקביליות (איזון מול רייט-לימיט של yfinance)
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
+EQUITY = float(os.getenv("EQUITY", "100000"))                 # ברירת מחדל: 100K$
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))   # 1% סיכון לעסקה
+COOLDOWN_DAYS = int(os.getenv("COOLDOWN_DAYS", "2"))          # מניעת היפוך מהיר
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))              # מקביליות ל-yfinance
+MAX_EXPOSURE = float(os.getenv("MAX_EXPOSURE", "0.6"))        # עד 60% הון בפוזיציות
 
 # קבצים
 MODEL_PATH = "model.pkl"
 SCALER_PATH = "scaler.pkl"
 CACHE_PREFIX = "cache_"
 RESULTS_CSV = "trading_bot_summary.csv"
-RESULTS_CSV_LIMITED = "trading_bot_summary_limited.csv"  # נשמר לשקיפות
+RESULTS_CSV_LIMITED = "trading_bot_summary_limited.csv"
+
+# Persist state
+PERSIST_DIR = ".trading_cache"
+os.makedirs(PERSIST_DIR, exist_ok=True)
+COOLDOWN_FILE = os.path.join(PERSIST_DIR, "cooldown_state.json")
 
 # טלגרם (אופציונלי; חינמי)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -100,7 +109,7 @@ def send_telegram_message(message: str):
 
 def load_tickers() -> List[str]:
     """טעינת טיקרים מ-tickers.json (או ברירת מחדל)."""
-    blacklist = {"ANSS"}  # דוגמה לטיקר בעייתי; אפשר להסיר אם תרצה
+    blacklist = {"ANSS"}  # דוגמה לטיקר בעייתי; ניתן להסיר
     test_tickers = ["AAPL", "MSFT", "GOOGL"]
     default_tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "META"]
 
@@ -123,6 +132,24 @@ def load_tickers() -> List[str]:
     else:
         logger.warning("tickers.json לא נמצא. משתמש ברשימת בדיקה.")
         return test_tickers
+
+
+def _load_cooldown_state() -> Dict[str, Dict[str, str]]:
+    try:
+        if os.path.exists(COOLDOWN_FILE):
+            with open(COOLDOWN_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        logger.warning(f"שגיאה בטעינת COOLDOWN_FILE: {e}")
+    return {}
+
+
+def _save_cooldown_state(state: Dict[str, Dict[str, str]]):
+    try:
+        with open(COOLDOWN_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"שגיאה בשמירת COOLDOWN_FILE: {e}")
 
 
 def is_nyse_holiday(date_obj: datetime.date) -> bool:
@@ -312,7 +339,7 @@ def calculate_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
 _data_cache: Dict[str, Dict] = {}
 
 def fetch_stock_data(ticker: str, period: str = "6mo", interval: str = "1d") -> Optional[pd.DataFrame]:
-    """משיכת נתוני yfinance עם קאש יומי (חינמי)."""
+    """משיכת נתוני yfinance עם קאש יומי (חינמי) + backoff אדפטיבי."""
     try:
         cache_key = safe_cache_key(ticker, period, interval)
         cache_file = f"{CACHE_PREFIX}{cache_key}.pkl"
@@ -331,20 +358,32 @@ def fetch_stock_data(ticker: str, period: str = "6mo", interval: str = "1d") -> 
             except Exception as e:
                 logger.warning(f"שגיאת טעינת קאש עבור {ticker}: {e}")
 
-        df = yf.Ticker(ticker).history(period=period, interval=interval)
-        if df is None or df.empty or len(df) < 50:
-            logger.warning(f"לא מספיק נתונים ל-{ticker}.")
-            return None
+        # עד 3 ניסיונות עם backoff
+        delay = 1.0
+        last_exc = None
+        for _ in range(3):
+            try:
+                df = yf.Ticker(ticker).history(period=period, interval=interval)
+                if df is not None and not df.empty and len(df) >= 50:
+                    obj = {"date": current_date, "data": df}
+                    _data_cache[cache_key] = obj
+                    try:
+                        with open(cache_file, "wb") as f:
+                            pickle.dump(obj, f)
+                    except Exception as e:
+                        logger.warning(f"שגיאת שמירת קאש עבור {ticker}: {e}")
+                    return df
+                else:
+                    last_exc = Exception("חוסר נתונים/מעט מדי שורות")
+            except Exception as e:
+                last_exc = e
+                logger.warning(f"שגיאת רשת/Rate עבור {ticker}, נסיון נוסף בעוד {delay:.1f}s: {e}")
+                time.sleep(delay)
+                delay *= 2  # backoff
 
-        obj = {"date": current_date, "data": df}
-        _data_cache[cache_key] = obj
-        try:
-            with open(cache_file, "wb") as f:
-                pickle.dump(obj, f)
-        except Exception as e:
-            logger.warning(f"שגיאת שמירת קאש עבור {ticker}: {e}")
-
-        return df
+        if last_exc:
+            logger.error(f"כשל סופי בשליפת נתונים ל-{ticker}: {last_exc}")
+        return None
     except Exception as e:
         logger.error(f"שגיאה בשליפת נתונים ל-{ticker}: {e}")
         return None
@@ -415,11 +454,11 @@ def prepare_ml_dataset(df: pd.DataFrame):
 
 
 def load_or_train_model(tickers: List[str]):
-    """שומר/טוען מודל כדי לחסוך זמן ב-CI. אימון על *כל* הטיקרים (חינמי)."""
+    """שומר/טוען מודל כדי לחסוך זמן ב-CI. אימון על *כל* הטיקרים (חינמי) עם TimeSeriesSplit."""
     model = None
     scaler = None
 
-    # נסה לטעון
+    # נסה לטעון מודל שמור
     if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH) and XGB_AVAILABLE:
         try:
             with open(MODEL_PATH, "rb") as f:
@@ -460,27 +499,71 @@ def load_or_train_model(tickers: List[str]):
         logger.warning("אין מספיק נתונים לאימון ML.")
         return None, StandardScaler()
 
-    X_train, X_test, y_train, y_test = train_test_split(all_X, all_y, test_size=0.2, random_state=42)
-    scaler = StandardScaler()
-    scaler.fit(X_train)
-    X_train_s = scaler.transform(X_train)
-    X_test_s = scaler.transform(X_test)
+    # אימות-זמן: TimeSeriesSplit + EarlyStopping (callbacks ל-XGB >= 2.0)
+    tscv = TimeSeriesSplit(n_splits=5)
+    best_model = None
+    best_score = -1e9
+    best_scaler = None
 
-    model = xgb.XGBClassifier(
-        n_estimators=150,
-        learning_rate=0.08,
-        max_depth=4,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        random_state=42,
-        eval_metric="logloss",
-        n_jobs=2,
-    )
-    # Early stopping (חינם): מונע אוברפיטינג
-    model.fit(X_train_s, y_train, eval_set=[(X_test_s, y_test)], early_stopping_rounds=30, verbose=False)
-    train_score = model.score(X_train_s, y_train)
-    test_score = model.score(X_test_s, y_test)
-    logger.info(f"מודל XGB אומן. Train={train_score:.3f}, Test={test_score:.3f}")
+    use_callbacks = True
+    try:
+        use_callbacks = _pkg_version.parse(xgb.__version__) >= _pkg_version.parse("2.0.0")
+    except Exception:
+        use_callbacks = True
+
+    for fold, (train_idx, test_idx) in enumerate(tscv.split(all_X), start=1):
+        X_train, X_test = all_X.iloc[train_idx], all_X.iloc[test_idx]
+        y_train, y_test = all_y.iloc[train_idx], all_y.iloc[test_idx]
+        scaler = StandardScaler()
+        scaler.fit(X_train)
+        X_train_s = scaler.transform(X_train)
+        X_test_s  = scaler.transform(X_test)
+
+        model = xgb.XGBClassifier(
+            n_estimators=200,
+            learning_rate=0.07,
+            max_depth=4,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            random_state=42 + fold,
+            n_jobs=2,
+        )
+
+        eval_set = [(X_test_s, y_test)]
+        if use_callbacks:
+            callbacks = [xgb.callback.EarlyStopping(
+                rounds=30,
+                metric_name="logloss",
+                data_name="validation_0",
+                save_best=True
+            )]
+            model.fit(
+                X_train_s, y_train,
+                eval_set=eval_set,
+                eval_metric="logloss",
+                callbacks=callbacks,
+                verbose=False
+            )
+        else:
+            # תאימות אחורה אם צריך (נדיר ב-2025)
+            model.fit(
+                X_train_s, y_train,
+                eval_set=eval_set,
+                eval_metric="logloss",
+                early_stopping_rounds=30,
+                verbose=False
+            )
+
+        fold_score = model.score(X_test_s, y_test)
+        logger.info(f"XGB TSCV fold {fold}: Test={fold_score:.3f}")
+        if fold_score > best_score:
+            best_score = fold_score
+            best_model = model
+            best_scaler = scaler
+
+    model = best_model
+    scaler = best_scaler
+    logger.info(f"מודל XGB נבחר לפי TimeSeriesSplit: Test={best_score:.3f}")
 
     try:
         with open(MODEL_PATH, "wb") as f:
@@ -625,6 +708,125 @@ def backtest_day_ahead(df: pd.DataFrame, strategy_func) -> Dict[str, float]:
         return {"Total_Return": 0.0, "Win_Rate": 0.0, "Avg_Pos": 0.0, "Avg_Neg": 0.0, "EV": 0.0}
 
 
+def backtest_multiday_with_costs(df: pd.DataFrame, strategy_func, hold_days: int = 5,
+                                 commission_bps: float = 5.0, slippage_bps: float = 5.0) -> Dict[str, float]:
+    """
+    Backtest רב-יומי עם עלויות:
+    - hold_days: מספר ימי החזקה לאחר איתות (ללא re-entry באמצע)
+    - commission_bps/slippage_bps: עלויות דו-צדדיות (קניה+מכירה), Basis Points (1/100%)
+    מחזיר: Equity curve, WinRate, Avg trade, EV, MaxDD, Sharpe גס.
+    """
+    try:
+        if len(df) < 100:
+            return {"Trades": 0, "WinRate": 0.0, "EV": 0.0, "MaxDD": 0.0, "Sharpe": 0.0, "Equity": []}
+
+        equity = [1.0]
+        pnl_trades = []
+        i = 50
+        while i < len(df) - 1:
+            window = df.iloc[:i+1]
+            sig = strategy_func(window)
+            side = 1 if sig == "BUY" else (-1 if sig == "SELL" else 0)
+            if side == 0:
+                equity.append(equity[-1])
+                i += 1
+                continue
+
+            # כניסה בסגירה של היום i (בקירוב), הוספת עלויות:
+            entry = df["Close"].iloc[i]
+            entry_cost = entry * (commission_bps + slippage_bps) / 10000.0
+            entry_effective = entry + entry_cost if side == 1 else entry - entry_cost
+
+            # יציאה אחרי hold_days או סוף דאטה:
+            exit_idx = min(i + hold_days, len(df) - 1)
+            exit_price = df["Close"].iloc[exit_idx]
+            exit_cost = exit_price * (commission_bps + slippage_bps) / 10000.0
+            exit_effective = exit_price - exit_cost if side == 1 else exit_price + exit_cost
+
+            trade_ret = (exit_effective / entry_effective - 1.0) * side
+            pnl_trades.append(trade_ret)
+
+            # עדכון equity (מצטבר)
+            equity.append(equity[-1] * (1.0 + trade_ret))
+
+            # דילוג עד היציאה (אין re-entry באמצע)
+            i = exit_idx + 1
+
+        if not pnl_trades:
+            return {"Trades": 0, "WinRate": 0.0, "EV": 0.0, "MaxDD": 0.0, "Sharpe": 0.0, "Equity": equity}
+
+        s = pd.Series(pnl_trades)
+        win_rate = (s > 0).mean()
+        avg_pos = float(s[s > 0].mean()) if (s > 0).any() else 0.0
+        avg_neg = float((-s[s < 0]).mean()) if (s < 0).any() else 0.0
+        ev = win_rate * avg_pos - (1 - win_rate) * avg_neg
+
+        # Max Drawdown
+        eq = pd.Series(equity)
+        peak = eq.cummax()
+        dd = (eq / peak - 1.0).min()
+        maxdd = float(abs(dd))
+
+        # Sharpe גס (יומי): ממוצע תשואות / סטיית תקן (ללא RF)
+        rets = eq.pct_change().dropna()
+        sharpe = float(rets.mean() / (rets.std() + 1e-9) * np.sqrt(252)) if not rets.empty else 0.0
+
+        return {"Trades": int(len(pnl_trades)), "WinRate": float(win_rate), "EV": float(ev),
+                "MaxDD": maxdd, "Sharpe": sharpe, "Equity": equity}
+    except Exception as e:
+        logger.error(f"שגיאת backtest_multiday_with_costs: {e}")
+        return {"Trades": 0, "WinRate": 0.0, "EV": 0.0, "MaxDD": 0.0, "Sharpe": 0.0, "Equity": []}
+
+
+def monthly_backtest_report(tickers: List[str], hold_days: int = 5,
+                            commission_bps: float = 5.0, slippage_bps: float = 5.0,
+                            out_csv: str = "monthly_backtest_report.csv",
+                            out_png: str = "monthly_equity_curve.png"):
+    """
+    מריץ backtest רב-יומי עם עלויות על כלל הטיקרים ומפיק דוח חודשי גס.
+    - מחבר Equity ממוצע (לא שקלול לפי שווי שוק) לצורך עקומה כללית.
+    """
+    rows = []
+    all_equities = []
+    for t in tickers:
+        df = fetch_stock_data(t, period="12mo", interval="1d")
+        if df is None or len(df) < 100:
+            continue
+        di = calculate_indicators(df)
+        if di is None:
+            continue
+        b1 = backtest_multiday_with_costs(di, strategy_trend_following, hold_days, commission_bps, slippage_bps)
+        b2 = backtest_multiday_with_costs(di, strategy_mean_reversion, hold_days, commission_bps, slippage_bps)
+        b3 = backtest_multiday_with_costs(di, strategy_breakout, hold_days, commission_bps, slippage_bps)
+        best = max([b1, b2, b3], key=lambda x: x["EV"])
+        rows.append({
+            "Ticker": t, "Trades": best["Trades"], "WinRate": best["WinRate"],
+            "EV": best["EV"], "MaxDD": best["MaxDD"], "Sharpe": best["Sharpe"]
+        })
+        if best["Equity"]:
+            all_equities.append(pd.Series(best["Equity"]))
+
+    if not rows:
+        logger.warning("לא הופק דוח חודשי (אין נתונים מספיקים).")
+        return
+
+    pd.DataFrame(rows).to_csv(out_csv, index=False)
+    if all_equities:
+        min_len = min(len(s) for s in all_equities)
+        stack = np.vstack([s.iloc[:min_len].values for s in all_equities])
+        mean_curve = stack.mean(axis=0)
+        plt.figure(figsize=(10, 5))
+        plt.plot(mean_curve)
+        plt.title("עקומת הון ממוצעת – Backtest רב-יומי (12 חודשים)")
+        plt.xlabel("טריידים/איטרציות")
+        plt.ylabel("Equity (נורמליזציה ל-1.0 בתחילת הדרך)")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(out_png)
+        plt.close()
+    logger.info(f"דוח חודשי נשמר: {out_csv}, גרף: {out_png}")
+
+
 def weighted_score(row: pd.Series) -> float:
     """דירוג לפי EV (80%) + WinRate (20%)."""
     return 0.8 * float(row.get("Best_EV", 0.0)) + 0.2 * float(row.get("Best_WinRate", 0.0))
@@ -647,10 +849,7 @@ def position_size_by_atr(entry_price: float, atr: float) -> int:
 
 
 def trailing_stop_levels(entry: float, atr: float, side: str, multiple: float = 1.5) -> float:
-    """
-    Trailing Stop לפי ATR: לונג – סטופ מתחת לכניסה במרחק multiple*ATR, שורט – מעל.
-    (הניהול בפועל יתבצע בסימולטור/דמו; כאן מחושב ערך התחלתי להצגה.)
-    """
+    """Trailing Stop לפי ATR."""
     if atr <= 0:
         return entry
     if side == "BUY":
@@ -660,8 +859,18 @@ def trailing_stop_levels(entry: float, atr: float, side: str, multiple: float = 
     return entry
 
 
-# מעקב אחר איתות אחרון לטיקר (למנגנון COOLDOWN)
+# מעקב אחר איתות אחרון לטיקר (למנגנון COOLDOWN) + Persist JSON
 _last_signal_date: Dict[str, Dict[str, datetime]] = {}
+_persist_cooldown_raw = _load_cooldown_state()
+for _tkr, _m in _persist_cooldown_raw.items():
+    dmap = {}
+    for k, iso in _m.items():
+        try:
+            dmap[k] = datetime.fromisoformat(iso)
+        except Exception:
+            pass
+    if dmap:
+        _last_signal_date[_tkr] = dmap
 
 
 # ===================== ויזואליזציה =====================
@@ -743,12 +952,14 @@ class AdvancedSwingTradingBot:
 
     def update_portfolio(self, ticker: str, signal: str):
         try:
+            # בדיקת חשיפה גסה: מספר פוזיציות * 20% הון (כי sizing מגביל ל-20% לפוזיציה)
             pos_count = sum(1 for p in self.portfolio.values() if p.get("position", 0) != 0)
+            approx_exposure = min(1.0, pos_count * 0.2)
+            if approx_exposure >= MAX_EXPOSURE and signal in ("BUY", "SELL"):
+                logger.warning(f"חצינו MAX_EXPOSURE~{MAX_EXPOSURE:.0%}. מדלג על {ticker} {signal}.")
+                return
             if ticker not in self.portfolio:
                 self.portfolio[ticker] = {"position": 0, "last_signal": "HOLD"}
-            if pos_count >= 5 and signal in ("BUY", "SELL"):
-                logger.warning(f"הגבלת פורטפוליו—מדלג על {ticker} {signal}.")
-                return
             current = self.portfolio[ticker]
             current["last_signal"] = signal
             current["position"] = 1 if signal == "BUY" else (-1 if signal == "SELL" else 0)
@@ -793,7 +1004,7 @@ class AdvancedSwingTradingBot:
             best_ev = max(bt_trend["EV"], bt_mean["EV"], bt_break["EV"])
             best_wr = max(bt_trend["Win_Rate"], bt_mean["Win_Rate"], bt_break["Win_Rate"])
 
-            # קירור אותות – מניעת היפוך מהיר
+            # קירור אותות – מניעת היפוך מהיר (Persist בין ריצות)
             today = datetime.utcnow().date()
             ls = _last_signal_date.get(ticker, {})
             if final_signal in ("BUY", "SELL"):
@@ -801,7 +1012,11 @@ class AdvancedSwingTradingBot:
                 if ls.get(other) and (today - ls[other].date()).days < COOLDOWN_DAYS:
                     final_signal = "HOLD"
             if final_signal in ("BUY", "SELL"):
-                _last_signal_date[ticker] = {final_signal: datetime.utcnow()}
+                _last_signal_date.setdefault(ticker, {})[final_signal] = datetime.utcnow()
+                persist_map = {k: v.isoformat() for k, v in _last_signal_date[ticker].items()}
+                raw = _load_cooldown_state()
+                raw[ticker] = persist_map
+                _save_cooldown_state(raw)
 
             trade = self.calc_trade_details(df, final_signal)
             trailing = trailing_stop_levels(trade["Entry_Price"], df.iloc[-1]["ATR"], final_signal)
@@ -896,6 +1111,12 @@ class AdvancedSwingTradingBot:
 
         df.to_csv(RESULTS_CSV, index=False)
         logger.info(f"נשמר סיכום ל-{RESULTS_CSV}")
+
+        # הפקת דוח חודשי גס (חינמי)
+        try:
+            monthly_backtest_report(self.tickers, hold_days=5, commission_bps=5.0, slippage_bps=5.0)
+        except Exception as e:
+            logger.warning(f"שגיאה בהפקת דוח חודשי: {e}")
 
         if self.failed_tickers:
             send_telegram_message(f"*טיקרים שנכשלו בעיבוד*\n{self.failed_tickers[:50]}{'...' if len(self.failed_tickers) > 50 else ''}")
