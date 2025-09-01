@@ -946,15 +946,21 @@ class AdvancedSwingTradingBot:
         tz_ist = pytz.timezone("Asia/Jerusalem")
         now_ist = datetime.now(tz_ist)
         nyse_open = is_nyse_open_now()
-        mode = ("אסטרטגיה מלאה על *כל* הטיקרים (שוק פתוח)" if nyse_open
-                else "אסטרטגיה מלאה על *כל* הטיקרים (שוק סגור, נתונים עדכניים אחרונים)")
+
+        # טקסטים בעברית (לא בתוך ביטוי לוגי של f-string)
+        status_txt = "פתוחה" if nyse_open else "סגורה"
+        mode = (
+            "אסטרטגיה מלאה על *כל* הטיקרים (שוק פתוח)" if nyse_open
+            else "אסטרטגיה מלאה על *כל* הטיקרים (שוק סגור, נתונים עדכניים אחרונים)"
+        )
 
         send_telegram_message(
             f"*בוט מסחר – תחילת ריצה*\n"
             f"זמן מקומי: {now_ist}\n"
-            f"סטטוס NYSE: {'פתוחה' אם nyse_open else 'סגורה'}\n"
+            f"סטטוס NYSE: {status_txt}\n"
             f"מצב ריצה: {mode}\n"
-            f"פרמטרים: הון={EQUITY:,.0f}$ | סיכון לעסקה={RISK_PER_TRADE*100:.1f}% | Cooldown={COOLDOWN_DAYS} ימים | Workers={MAX_WORKERS}"
+            f"פרמטרים: הון={EQUITY:,.0f}$ | סיכון לעסקה={RISK_PER_TRADE*100:.1f}% | "
+            f"Cooldown={COOLDOWN_DAYS} ימים | Workers={MAX_WORKERS}"
         )
 
         start = time.time()
