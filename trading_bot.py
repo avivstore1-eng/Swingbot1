@@ -15,12 +15,13 @@ import logging
 import json
 from typing import Dict, List, Optional
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split  # Fixed import
+from sklearn.model_selection import train_test_split
 import pytz
 import matplotlib.pyplot as plt
 import random
 import pickle
 import hashlib
+import signal
 from concurrent.futures import ProcessPoolExecutor, TimeoutError, as_completed
 
 # Check for xgboost and send Telegram alert if missing
@@ -51,6 +52,12 @@ logger = logging.getLogger(__name__)
 # Configuration
 force_analysis_when_closed = True  # If True, run full strategy even when market is closed
 
+class TimeoutException(Exception):
+    pass
+
+def timeout_handler(signum, frame):
+    raise TimeoutException("Timeout exceeded")
+
 class AdvancedSwingTradingBot:
     def __init__(self):
         self.tickers = self.load_tickers()
@@ -69,7 +76,10 @@ class AdvancedSwingTradingBot:
 
     # ----------------- Ticker Management -----------------
     def load_tickers(self) -> List[str]:
+        # For testing, use only a few tickers
+        test_tickers = ['AAPL', 'MSFT', 'GOOGL']
         default_tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META']
+        
         if os.path.exists('tickers.json'):
             try:
                 with open('tickers.json', 'r') as f:
@@ -84,8 +94,8 @@ class AdvancedSwingTradingBot:
                     raise ValueError("All items in tickers.json must be strings")
                 if not tickers:
                     raise ValueError("tickers.json is empty")
-                # Limit to 200 tickers to avoid overload
-                tickers = tickers[:200]
+                # Limit to 10 tickers for testing
+                tickers = tickers[:10]
                 logger.info(f"Loaded {len(tickers)} tickers from tickers.json: {tickers[:5]}{'...' if len(tickers) > 5 else ''}")
                 return tickers
             except json.JSONDecodeError as e:
@@ -93,8 +103,8 @@ class AdvancedSwingTradingBot:
             except Exception as e:
                 logger.error(f"Error loading tickers.json: {e}. Using default tickers")
         else:
-            logger.warning("tickers.json not found. Using default tickers")
-        return default_tickers
+            logger.warning("tickers.json not found. Using test tickers")
+        return test_tickers
 
     # ----------------- Check NYSE Trading Hours -----------------
     def is_nyse_open(self) -> bool:
@@ -142,7 +152,7 @@ class AdvancedSwingTradingBot:
         for attempt in range(3):
             try:
                 stock = yf.Ticker(ticker)
-                data = stock.history(period=period, interval=interval, timeout=10)
+                data = stock.history(period=period, interval=interval, timeout=15)  # Increased timeout
                 if data.empty or len(data) < 50:
                     logger.warning(f"Insufficient data for {ticker} (rows: {len(data)})")
                     return None
@@ -323,7 +333,7 @@ class AdvancedSwingTradingBot:
         all_features = pd.DataFrame()
         all_targets = pd.Series(dtype='int64')
         self.failed_tickers = []
-        training_tickers = random.sample(self.tickers, min(100, len(self.tickers)))
+        training_tickers = random.sample(self.tickers, min(10, len(self.tickers)))  # Reduced for testing
         logger.info(f"Training ML model on {len(training_tickers)} tickers")
         for ticker in training_tickers:
             logger.info(f"Processing ticker {ticker} for ML training")
@@ -351,7 +361,7 @@ class AdvancedSwingTradingBot:
             self.scaler.fit(X_train)
             X_train_scaled = self.scaler.transform(X_train)
             X_test_scaled = self.scaler.transform(X_test)
-            self.model = xgb.XGBClassifier(n_estimators=200, learning_rate=0.1, max_depth=3, random_state=42, eval_metric='logloss')
+            self.model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=3, random_state=42, eval_metric='logloss')  # Reduced n_estimators
             self.model.fit(X_train_scaled, y_train)
             train_score = self.model.score(X_train_scaled, y_train)
             test_score = self.model.score(X_test_scaled, y_test)
@@ -604,27 +614,17 @@ class AdvancedSwingTradingBot:
     # ----------------- Full Strategy -----------------
     def run_full_strategy(self):
         results = []
-        max_workers = min(os.cpu_count() or 4, 4)
+        # Use only 1 worker to avoid GitHub Actions limitations
+        max_workers = 1
         logger.info(f"Using {max_workers} processes for multiprocessing")
         self.failed_tickers = []
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            future_to_ticker = {executor.submit(self.process_ticker, ticker): ticker for ticker in self.tickers}
-            processed = 0
-            for future in as_completed(future_to_ticker):
-                ticker = future_to_ticker[future]
-                try:
-                    result = future.result(timeout=30)
-                    if result is not None:
-                        results.append(result)
-                    processed += 1
-                    if processed % 50 == 0:
-                        logger.info(f"Processed {processed}/{len(self.tickers)} tickers")
-                except TimeoutError:
-                    logger.error(f"Timeout processing {ticker} after 30 seconds")
-                    self.failed_tickers.append(ticker)
-                except Exception as e:
-                    logger.error(f"Error processing {ticker}: {e}")
-                    self.failed_tickers.append(ticker)
+        
+        # Process tickers sequentially instead of parallel
+        for ticker in self.tickers:
+            logger.info(f"Processing {ticker}")
+            result = self.process_ticker(ticker)
+            if result is not None:
+                results.append(result)
         
         if results:
             results_df = pd.DataFrame(results)
@@ -672,22 +672,15 @@ class AdvancedSwingTradingBot:
     # ----------------- Single Run with Latest Data -----------------
     def run_single_run_with_latest_data(self):
         results = []
-        sample_tickers = random.sample(self.tickers, min(50, len(self.tickers)))
+        sample_tickers = random.sample(self.tickers, min(5, len(self.tickers)))  # Reduced for testing
         logger.info(f"Processing {len(sample_tickers)} tickers for single run")
-        with ProcessPoolExecutor(max_workers=min(os.cpu_count() or 4, 4)) as executor:
-            future_to_ticker = {executor.submit(self.process_ticker, ticker): ticker for ticker in sample_tickers}
-            for future in as_completed(future_to_ticker):
-                ticker = future_to_ticker[future]
-                try:
-                    result = future.result(timeout=30)
-                    if result is not None:
-                        results.append(result)
-                except TimeoutError:
-                    logger.error(f"Timeout processing {ticker} after 30 seconds")
-                    self.failed_tickers.append(ticker)
-                except Exception as e:
-                    logger.error(f"Error processing {ticker}: {e}")
-                    self.failed_tickers.append(ticker)
+        
+        # Process sequentially
+        for ticker in sample_tickers:
+            logger.info(f"Processing {ticker}")
+            result = self.process_ticker(ticker)
+            if result is not None:
+                results.append(result)
         
         if results:
             results_df = pd.DataFrame(results)
@@ -735,21 +728,32 @@ class AdvancedSwingTradingBot:
         )
         self.failed_tickers = []
 
-        if self.is_nyse_open():
-            logger.info("Market open – running full strategy")
-            self.run_full_strategy()
-        else:
-            if force_analysis_when_closed:
-                logger.info("Market closed – running full strategy on latest available data")
+        # Set up timeout handler
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(600)  # 10 minutes timeout
+
+        try:
+            if self.is_nyse_open():
+                logger.info("Market open – running full strategy")
                 self.run_full_strategy()
             else:
-                logger.info("Market closed – single run only")
-                self.run_single_run_with_latest_data()
-        
-        elapsed_time = time.time() - start_time
-        logger.info(f"Single run completed in {elapsed_time:.2f}s")
-        if elapsed_time > 600:
-            self.send_telegram_message(f"*Warning*: Bot run took {elapsed_time/60:.1f} minutes, exceeding 10 minutes. Check logs.")
+                if force_analysis_when_closed:
+                    logger.info("Market closed – running full strategy on latest available data")
+                    self.run_full_strategy()
+                else:
+                    logger.info("Market closed – single run only")
+                    self.run_single_run_with_latest_data()
+            
+            elapsed_time = time.time() - start_time
+            logger.info(f"Single run completed in {elapsed_time:.2f}s")
+            if elapsed_time > 600:
+                self.send_telegram_message(f"*Warning*: Bot run took {elapsed_time/60:.1f} minutes, exceeding 10 minutes. Check logs.")
+                
+        except TimeoutException:
+            logger.error("Bot execution timed out after 10 minutes")
+            self.send_telegram_message("*Error*: Bot execution timed out after 10 minutes. Check logs.")
+        finally:
+            signal.alarm(0)  # Cancel the alarm
 
 if __name__ == "__main__":
     bot = AdvancedSwingTradingBot()
