@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Advanced Swing Trading Bot 11/10 – Optimized for Speed, Robust Timeout, Runs Anytime
+Advanced Swing Trading Bot 11/10 – Single Run, No Sentiment, Runs Anytime with Latest Prices
 Free, GitHub Actions ready, no TA-Lib, no external APIs, JSON tickers
 """
 
@@ -16,30 +16,10 @@ import json
 from typing import Dict, List, Optional
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
+import xgboost as xgb
+import matplotlib.pyplot as plt
 import pytz
 from multiprocessing import Pool, cpu_count
-import matplotlib.pyplot as plt
-import random
-import pickle
-import hashlib
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
-
-# Check for xgboost and send Telegram alert if missing
-try:
-    import xgboost as xgb
-except ImportError:
-    def send_emergency_telegram(message: str):
-        token = os.getenv('TELEGRAM_BOT_TOKEN')
-        chat_id = os.getenv('TELEGRAM_CHAT_ID')
-        if token and chat_id:
-            url = f"https://api.telegram.org/bot{token}/sendMessage"
-            payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
-            try:
-                requests.post(url, data=payload, timeout=10)
-            except:
-                pass
-    send_emergency_telegram("*Critical Error*: xgboost module not found. Please ensure xgboost is installed.")
-    raise ImportError("xgboost module not found. Install with 'pip install xgboost'.")
 
 # Logging
 logging.basicConfig(
@@ -61,7 +41,6 @@ class AdvancedSwingTradingBot:
             'telegram_bot': os.getenv('TELEGRAM_BOT_TOKEN'),
             'telegram_chat_id': os.getenv('TELEGRAM_CHAT_ID')
         }
-        self.data_cache = {}
         logger.info("Bot initialized. Training ML model...")
         self.train_ml_model_all_tickers()
 
@@ -82,86 +61,45 @@ class AdvancedSwingTradingBot:
                     raise ValueError("All items in tickers.json must be strings")
                 if not tickers:
                     raise ValueError("tickers.json is empty")
-                logger.info(f"Loaded {len(tickers)} tickers from tickers.json")
+                logger.info(f"Loaded {len(tickers)} tickers from tickers.json: {tickers[:5]}{'...' if len(tickers) > 5 else ''}")
                 return tickers
             except json.JSONDecodeError as e:
-                logger.error(f"Invalid JSON format in tickers.json: {e}. Using default tickers")
+                logger.error(f"Invalid JSON format in tickers.json: {e}. Using default tickers: {default_tickers}")
             except Exception as e:
-                logger.error(f"Error loading tickers.json: {e}. Using default tickers")
+                logger.error(f"Error loading tickers.json: {e}. Using default tickers: {default_tickers}")
         else:
-            logger.warning(f"tickers.json not found. Using default tickers")
+            logger.warning(f"tickers.json not found. Using default tickers: {default_tickers}")
         return default_tickers
 
     # ----------------- Check NYSE Trading Hours -----------------
     def is_nyse_open(self) -> bool:
-        try:
-            tz_ny = pytz.timezone('America/New_York')
-            now_ny = datetime.now(tz_ny)
-            # Check if it's a weekday (Monday=0, Sunday=6)
-            if now_ny.weekday() >= 5:
-                logger.info("NYSE closed: Weekend")
-                return False
-            # NYSE trading hours: 9:30 AM to 4:00 PM ET
-            market_open = now_ny.replace(hour=9, minute=30, second=0, microsecond=0)
-            market_close = now_ny.replace(hour=16, minute=0, second=0, microsecond=0)
-            is_open = market_open <= now_ny <= market_close
-            logger.info(f"NYSE open check: {now_ny} -> {'open' if is_open else 'closed'}")
-            return is_open
-        except Exception as e:
-            logger.error(f"Error checking NYSE hours: {e}")
+        tz_ny = pytz.timezone('America/New_York')
+        now_ny = datetime.now(tz_ny)
+        if now_ny.weekday() >= 5:
             return False
+        market_open = now_ny.replace(hour=9, minute=30, second=0, microsecond=0)
+        market_close = now_ny.replace(hour=16, minute=0, second=0, microsecond=0)
+        return market_open <= now_ny <= market_close
 
-    # ----------------- Fetch Data with Cache and Retries -----------------
-    def fetch_stock_data(self, ticker: str, period: str = '3mo', interval: str = '1d') -> Optional[pd.DataFrame]:
-        cache_key = hashlib.md5(f"{ticker}_{period}_{interval}".encode()).hexdigest()
-        cache_file = f"cache_{cache_key}.pkl"
-        current_date = datetime.now().date().isoformat()
-        
-        # Check cache
-        if cache_key in self.data_cache and self.data_cache[cache_key]['date'] == current_date:
-            logger.info(f"Using cached data for {ticker}")
-            return self.data_cache[cache_key]['data']
-        
-        # Load from disk cache if exists and valid
-        if os.path.exists(cache_file):
-            try:
-                with open(cache_file, 'rb') as f:
-                    cached = pickle.load(f)
-                if cached['date'] == current_date:
-                    self.data_cache[cache_key] = cached
-                    logger.info(f"Loaded cached data from disk for {ticker}")
-                    return cached['data']
-            except Exception as e:
-                logger.warning(f"Error loading cache for {ticker}: {e}")
-        
-        # Fetch new data with retries
-        for attempt in range(3):
-            try:
-                stock = yf.Ticker(ticker)
-                data = stock.history(period=period, interval=interval, timeout=10)
-                if data.empty or len(data) < 50:
-                    logger.warning(f"Insufficient data for {ticker} (rows: {len(data)})")
-                    return None
-                required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
-                if not all(col in data.columns for col in required_columns):
-                    logger.warning(f"Missing required columns for {ticker}: {data.columns}")
-                    return None
-                # Save to cache
-                self.data_cache[cache_key] = {'date': current_date, 'data': data}
-                try:
-                    with open(cache_file, 'wb') as f:
-                        pickle.dump(self.data_cache[cache_key], f)
-                    logger.info(f"Saved data to cache for {ticker}")
-                except Exception as e:
-                    logger.warning(f"Error saving cache for {ticker}: {e}")
-                return data
-            except Exception as e:
-                logger.error(f"Attempt {attempt+1}/3 failed for {ticker}: {e}")
-                if attempt < 2:
-                    time.sleep(2)
-                else:
-                    logger.error(f"All attempts failed for {ticker}")
-                    return None
+    # ----------------- Fetch Data -----------------
+    def fetch_stock_data(self, ticker: str, period: str = '6mo', interval: str = '1d') -> Optional[pd.DataFrame]:
+        try:
+            stock = yf.Ticker(ticker)
+            data = stock.history(period=period, interval=interval)
+            if data.empty or len(data) < 50:
+                logger.warning(f"Insufficient data for {ticker} (rows: {len(data)})")
+                self.failed_tickers.append(ticker)
+                return None
+            required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+            if not all(col in data.columns for col in required_columns):
+                logger.warning(f"Missing required columns for {ticker}: {data.columns}")
+                self.failed_tickers.append(ticker)
+                return None
+            return data
+        except Exception as e:
+            logger.error(f"Error fetching data for {ticker}: {e}")
+            self.failed_tickers.append(ticker)
+            return None
 
     # ----------------- Indicators -----------------
     def calculate_advanced_indicators(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
@@ -530,7 +468,7 @@ class AdvancedSwingTradingBot:
             logger.error(f"Error calculating trade details: {e}")
             return {"Entry_Price": 0.0, "Take_Profit": 0.0, "Stop_Loss": 0.0}
 
-    # ----------------- Process Single Ticker -----------------
+    # ----------------- Process single Ticker -----------------
     def process_ticker(self, ticker: str) -> Optional[Dict]:
         try:
             start_time = time.time()
@@ -578,21 +516,6 @@ class AdvancedSwingTradingBot:
             self.failed_tickers.append(ticker)
             return None
 
-    # ----------------- Process Ticker with Timeout -----------------
-    def process_ticker_with_timeout(self, ticker: str) -> Optional[Dict]:
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(self.process_ticker, ticker)
-            try:
-                return future.result(timeout=30)
-            except TimeoutError:
-                logger.error(f"Timeout processing {ticker} after 30 seconds")
-                self.failed_tickers.append(ticker)
-                return None
-            except Exception as e:
-                logger.error(f"Error in process_ticker_with_timeout for {ticker}: {e}")
-                self.failed_tickers.append(ticker)
-                return None
-
     # ----------------- Run Bot -----------------
     def run_once(self):
         tz_ist = pytz.timezone('Asia/Jerusalem')
@@ -613,7 +536,7 @@ class AdvancedSwingTradingBot:
         num_processes = min(cpu_count(), 4)
         logger.info(f"Using {num_processes} processes for multiprocessing")
         with Pool(processes=num_processes) as pool:
-            for i, result in enumerate(pool.imap_unordered(self.process_ticker_with_timeout, self.tickers)):
+            for i, result in enumerate(pool.imap_unordered(self.process_ticker, self.tickers)):
                 if result is not None:
                     results.append(result)
                 if (i + 1) % 50 == 0:
