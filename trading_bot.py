@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Advanced Swing Trading Bot 10/10 – Full Version
+Advanced Swing Trading Bot 10/10 – Full Version with Top Picks
 Free, GitHub Actions ready, no TA-Lib, no Alpha Vantage, JSON tickers
 """
 
@@ -53,13 +53,12 @@ class AdvancedSwingTradingBot:
             try:
                 with open('tickers.json', 'r') as f:
                     data = json.load(f)
-                # Handle both array and {"tickers": [...]} formats
                 if isinstance(data, dict) and 'tickers' in data:
                     tickers = data['tickers']
                 elif isinstance(data, list):
                     tickers = data
                 else:
-                    raise ValueError("tickers.json must contain a list or an object with 'tickers' key containing a list")
+                    raise ValueError("tickers.json must contain a list or an object with 'tickers' key")
                 if not all(isinstance(t, str) for t in tickers):
                     raise ValueError("All items in tickers.json must be strings")
                 if not tickers:
@@ -71,18 +70,8 @@ class AdvancedSwingTradingBot:
             except Exception as e:
                 logger.error(f"Error loading tickers.json: {e}. Using default tickers: {default_tickers}")
         else:
-            logger.warning(f"tickers.json not found in repository. Using default tickers: {default_tickers}")
+            logger.warning(f"tickers.json not found. Using default tickers: {default_tickers}")
         return default_tickers
-
-    def add_ticker(self, ticker: str):
-        if ticker not in self.tickers:
-            self.tickers.append(ticker)
-            logger.info(f"Added ticker: {ticker}")
-
-    def remove_ticker(self, ticker: str):
-        if ticker in self.tickers:
-            self.tickers.remove(ticker)
-            logger.info(f"Removed ticker: {ticker}")
 
     # ----------------- Fetch Data -----------------
     def fetch_stock_data(self, ticker: str, period: str = '6mo', interval: str = '1d') -> Optional[pd.DataFrame]:
@@ -93,7 +82,6 @@ class AdvancedSwingTradingBot:
                 logger.warning(f"Insufficient data for {ticker} (rows: {len(data)})")
                 self.failed_tickers.append(ticker)
                 return None
-            # Ensure required columns exist
             required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
             if not all(col in data.columns for col in required_columns):
                 logger.warning(f"Missing required columns for {ticker}: {data.columns}")
@@ -108,7 +96,7 @@ class AdvancedSwingTradingBot:
     # ----------------- Indicators -----------------
     def calculate_advanced_indicators(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
         try:
-            if len(df) < 50:  # Ensure enough data for calculations
+            if len(df) < 50:
                 logger.warning(f"Insufficient rows ({len(df)}) for indicators calculation")
                 return None
             df = df.copy()
@@ -120,6 +108,9 @@ class AdvancedSwingTradingBot:
             df['BB_Middle'] = df['Close'].rolling(20).mean()
             df['BB_Upper'] = df['BB_Middle'] + 2 * df['Close'].rolling(20).std()
             df['BB_Lower'] = df['BB_Middle'] - 2 * df['Close'].rolling(20).std()
+            if df['BB_Upper'].isna().all() or df['BB_Lower'].isna().all() or df['RSI'].isna().all():
+                logger.warning("Invalid Bollinger Bands or RSI values")
+                return None
             df['SlowK'], df['SlowD'] = self.compute_stochastic(df)
             df['Volume_MA'] = df['Volume'].rolling(20).mean()
             df['Volume_Ratio'] = df['Volume'] / df['Volume_MA']
@@ -127,7 +118,7 @@ class AdvancedSwingTradingBot:
             df['ADX'] = self.compute_ADX(df)
             df['Price_vs_EMA20'] = df['Close'] / df['EMA_20'] - 1
             df['Price_vs_EMA50'] = df['Close'] / df['EMA_50'] - 1
-            df = df.fillna(0)  # Handle NaNs
+            df = df.fillna(0)
             return df
         except Exception as e:
             logger.error(f"Error calculating indicators: {e}")
@@ -219,7 +210,7 @@ class AdvancedSwingTradingBot:
     def prepare_ml_features(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
         try:
             if len(df) < 6:
-                logger.warning(f"Insufficient data rows ({len(df)}) for ML features. Skipping.")
+                logger.warning(f"Insufficient data rows ({len(df)}) for ML features")
                 return None
             latest = df.iloc[-1]
             features = {
@@ -245,7 +236,7 @@ class AdvancedSwingTradingBot:
     def prepare_ml_data(self, df: pd.DataFrame):
         try:
             if len(df) < 50:
-                logger.warning(f"Insufficient data rows ({len(df)}) for ML data. Skipping.")
+                logger.warning(f"Insufficient data rows ({len(df)}) for ML data")
                 return pd.DataFrame(), pd.Series(dtype='int64')
             features_df = pd.DataFrame()
             targets = []
@@ -278,7 +269,7 @@ class AdvancedSwingTradingBot:
     def train_ml_model_all_tickers(self):
         all_features = pd.DataFrame()
         all_targets = pd.Series(dtype='int64')
-        self.failed_tickers = []  # Reset failed tickers
+        self.failed_tickers = []
         for ticker in self.tickers:
             df = self.fetch_stock_data(ticker)
             if df is None:
@@ -292,10 +283,10 @@ class AdvancedSwingTradingBot:
                 all_features = pd.concat([all_features, features], ignore_index=True)
                 all_targets = pd.concat([all_targets, targets], ignore_index=True)
             else:
-                logger.warning(f"No valid ML data for {ticker}. Skipping.")
+                logger.warning(f"No valid ML data for {ticker}")
                 self.failed_tickers.append(ticker)
         if all_features.empty or len(all_targets) < 10:
-            logger.warning("Insufficient data for ML training. Skipping.")
+            logger.warning("Insufficient data for ML training")
             return
         try:
             X_train, X_test, y_train, y_test = train_test_split(all_features, all_targets, test_size=0.2, random_state=42)
@@ -331,7 +322,6 @@ class AdvancedSwingTradingBot:
     def strategy_trend_following(self, df: pd.DataFrame) -> str:
         try:
             if len(df) < 50 or df['EMA_20'].isna().all() or df['EMA_50'].isna().all() or df['EMA_200'].isna().all():
-                logger.warning("Insufficient or invalid data for trend following strategy")
                 return "HOLD"
             latest = df.iloc[-1]
             if latest['EMA_20'] > latest['EMA_50'] > latest['EMA_200'] and latest['ADX'] > 25:
@@ -346,7 +336,6 @@ class AdvancedSwingTradingBot:
     def strategy_mean_reversion(self, df: pd.DataFrame) -> str:
         try:
             if len(df) < 50 or df['RSI'].isna().all() or df['BB_Lower'].isna().all() or df['BB_Upper'].isna().all():
-                logger.warning("Insufficient or invalid data for mean reversion strategy")
                 return "HOLD"
             latest = df.iloc[-1]
             if latest['RSI'] < 30 and latest['Close'] < latest['BB_Lower']:
@@ -361,7 +350,6 @@ class AdvancedSwingTradingBot:
     def strategy_breakout(self, df: pd.DataFrame) -> str:
         try:
             if len(df) < 50 or df['High'].isna().all() or df['Low'].isna().all():
-                logger.warning("Insufficient or invalid data for breakout strategy")
                 return "HOLD"
             latest = df.iloc[-1]
             high_20 = df['High'].rolling(20).max().iloc[-2]
@@ -402,7 +390,7 @@ class AdvancedSwingTradingBot:
             token = self.api_keys['telegram_bot']
             chat_id = self.api_keys['telegram_chat_id']
             if not token or not chat_id:
-                logger.warning("Telegram keys missing. Skipping message. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in GitHub Secrets.")
+                logger.warning("Telegram keys missing. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in GitHub Secrets.")
                 return
             url = f"https://api.telegram.org/bot{token}/sendMessage"
             payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
@@ -438,8 +426,17 @@ class AdvancedSwingTradingBot:
                 return {"Total_Return": 0.0, "Win_Rate": 0.0}
             df = df.copy()
             signals = []
+            failed_logged = False
             for i in range(len(df)):
-                signal = strategy_func(df.iloc[:i+1])
+                window = df.iloc[:i+1]
+                if len(window) < 50:
+                    signals.append("HOLD")
+                    continue
+                signal = strategy_func(window)
+                if signal == "HOLD" and not failed_logged:
+                    if len(window) < 50 or window['RSI'].isna().all() or window['BB_Lower'].isna().all() or window['BB_Upper'].isna().all():
+                        logger.warning(f"Invalid data for {strategy_func.__name__} during backtest")
+                        failed_logged = True
                 signals.append(signal)
             df['Signal'] = signals
             df['Returns'] = df['Close'].pct_change().shift(-1) * df['Signal'].map({"BUY": 1, "SELL": -1, "HOLD": 0})
@@ -450,11 +447,34 @@ class AdvancedSwingTradingBot:
             logger.error(f"Error in backtesting: {e}")
             return {"Total_Return": 0.0, "Win_Rate": 0.0}
 
+    # ----------------- Calculate Trade Details -----------------
+    def calculate_trade_details(self, df: pd.DataFrame, signal: str) -> Dict[str, float]:
+        try:
+            latest = df.iloc[-1]
+            entry_price = latest['Close']
+            atr = latest['ATR']
+            if signal == "BUY":
+                take_profit = entry_price + 2 * atr
+                stop_loss = entry_price - atr
+            elif signal == "SELL":
+                take_profit = entry_price - 2 * atr
+                stop_loss = entry_price + atr
+            else:
+                take_profit = stop_loss = entry_price
+            return {
+                "Entry_Price": entry_price,
+                "Take_Profit": take_profit,
+                "Stop_Loss": stop_loss
+            }
+        except Exception as e:
+            logger.error(f"Error calculating trade details: {e}")
+            return {"Entry_Price": 0.0, "Take_Profit": 0.0, "Stop_Loss": 0.0}
+
     # ----------------- Run Bot -----------------
     def run_once(self):
         logger.info("Starting Advanced Swing Trading Bot - Single Run")
-        self.failed_tickers = []  # Reset failed tickers
-        results = []  # Collect results for summary
+        self.failed_tickers = []
+        results = []
         for ticker in self.tickers:
             try:
                 df = self.fetch_stock_data(ticker)
@@ -470,12 +490,11 @@ class AdvancedSwingTradingBot:
                 signal_ml = self.get_ml_signal(df)
                 signals = [signal_trend, signal_mean, signal_breakout, signal_ml]
                 final_signal = max(set(signals), key=signals.count)
-                self.update_portfolio(ticker, final_signal)
                 sentiment_news = self.get_news_sentiment(ticker)
                 backtest_trend = self.backtest_strategy(df, self.strategy_trend_following)
                 backtest_mean = self.backtest_strategy(df, self.strategy_mean_reversion)
                 backtest_breakout = self.backtest_strategy(df, self.strategy_breakout)
-                # Log details for each ticker
+                trade_details = self.calculate_trade_details(df, final_signal)
                 logger.info(
                     f"Processing {ticker}:\n"
                     f"  Signal: {final_signal} (ML: {signal_ml})\n"
@@ -483,19 +502,10 @@ class AdvancedSwingTradingBot:
                     f"  News Sentiment: {sentiment_news:.2f}\n"
                     f"  Backtest: Trend {backtest_trend['Total_Return']:.2f} (Win: {backtest_trend['Win_Rate']:.2f}), "
                     f"Mean {backtest_mean['Total_Return']:.2f} (Win: {backtest_mean['Win_Rate']:.2f}), "
-                    f"Breakout {backtest_breakout['Total_Return']:.2f} (Win: {backtest_breakout['Win_Rate']:.2f})"
+                    f"Breakout {backtest_breakout['Total_Return']:.2f} (Win: {backtest_breakout['Win_Rate']:.2f})\n"
+                    f"  Trade: Entry ${trade_details['Entry_Price']:.2f}, TP ${trade_details['Take_Profit']:.2f}, SL ${trade_details['Stop_Loss']:.2f}"
                 )
-                # Send Telegram message
-                message = (
-                    f"*{ticker}*\n"
-                    f"Signal: {final_signal} (ML: {signal_ml})\n"
-                    f"Trend: {signal_trend}, Mean: {signal_mean}, Breakout: {signal_breakout}\n"
-                    f"News Sentiment: {sentiment_news:.2f}\n"
-                    f"Backtest: Trend {backtest_trend['Total_Return']:.2f}, Mean {backtest_mean['Total_Return']:.2f}, "
-                    f"Breakout {backtest_breakout['Total_Return']:.2f}"
-                )
-                self.send_telegram_message(message)
-                # Collect result for summary
+                # Collect result for summary and filtering
                 result = {
                     'Ticker': ticker,
                     'Final_Signal': final_signal,
@@ -505,22 +515,63 @@ class AdvancedSwingTradingBot:
                     'Breakout_Signal': signal_breakout,
                     'News_Sentiment': sentiment_news,
                     'Backtest_Trend': backtest_trend['Total_Return'],
+                    'Backtest_Trend_Win': backtest_trend['Win_Rate'],
                     'Backtest_Mean': backtest_mean['Total_Return'],
-                    'Backtest_Breakout': backtest_breakout['Total_Return']
+                    'Backtest_Mean_Win': backtest_mean['Win_Rate'],
+                    'Backtest_Breakout': backtest_breakout['Total_Return'],
+                    'Backtest_Breakout_Win': backtest_breakout['Win_Rate'],
+                    'Entry_Price': trade_details['Entry_Price'],
+                    'Take_Profit': trade_details['Take_Profit'],
+                    'Stop_Loss': trade_details['Stop_Loss']
                 }
                 results.append(result)
+                # Send Telegram message only for top picks
+                if final_signal != "HOLD":
+                    weighted_score = (
+                        0.4 * max(backtest_trend['Total_Return'], backtest_mean['Total_Return'], backtest_breakout['Total_Return']) +
+                        0.3 * max(backtest_trend['Win_Rate'], backtest_mean['Win_Rate'], backtest_breakout['Win_Rate']) +
+                        0.3 * abs(sentiment_news)
+                    )
+                    if (final_signal == "BUY" and sentiment_news > 0.1) or (final_signal == "SELL" and sentiment_news < -0.1):
+                        if max(backtest_trend['Total_Return'], backtest_mean['Total_Return'], backtest_breakout['Total_Return']) > 0.05:
+                            if max(backtest_trend['Win_Rate'], backtest_mean['Win_Rate'], backtest_breakout['Win_Rate']) > 0.6:
+                                win_rate = max(
+                                    (backtest_trend['Win_Rate'] if signal_trend == final_signal else 0),
+                                    (backtest_mean['Win_Rate'] if signal_mean == final_signal else 0),
+                                    (backtest_breakout['Win_Rate'] if signal_breakout == final_signal else 0)
+                                )
+                                message = (
+                                    f"*{ticker}* - *{final_signal}*\n"
+                                    f"Entry: ${trade_details['Entry_Price']:.2f}\n"
+                                    f"Take Profit: ${trade_details['Take_Profit']:.2f}\n"
+                                    f"Stop Loss: ${trade_details['Stop_Loss']:.2f}\n"
+                                    f"Win Rate: {win_rate*100:.1f}%\n"
+                                    f"News Sentiment: {sentiment_news:.2f}\n"
+                                    f"Backtest: Trend {backtest_trend['Total_Return']:.2f}, Mean {backtest_mean['Total_Return']:.2f}, "
+                                    f"Breakout {backtest_breakout['Total_Return']:.2f}\n"
+                                    f"Score: {weighted_score:.2f}"
+                                )
+                                self.send_telegram_message(message)
                 self.visualize_signals(df, ticker)
-                time.sleep(0.1)  # Tiny delay to avoid overwhelming yfinance/NewsAPI
+                time.sleep(0.1)
             except Exception as e:
                 logger.error(f"Error processing {ticker}: {e}")
                 self.failed_tickers.append(ticker)
         # Create and save summary
         if results:
             results_df = pd.DataFrame(results)
+            # Sort by weighted score for summary
+            results_df['Weighted_Score'] = (
+                0.4 * results_df[['Backtest_Trend', 'Backtest_Mean', 'Backtest_Breakout']].max(axis=1) +
+                0.3 * results_df[['Backtest_Trend_Win', 'Backtest_Mean_Win', 'Backtest_Breakout_Win']].max(axis=1) +
+                0.3 * results_df['News_Sentiment'].abs()
+            )
+            top_picks = results_df[results_df['Final_Signal'] != "HOLD"].sort_values(by='Weighted_Score', ascending=False).head(5)
             summary = results_df.to_string(index=False)
             logger.info(f"Run Summary:\n{summary}")
-            self.send_telegram_message(f"*Run Summary*\n```\n{summary}\n```")
-            # Save summary to CSV
+            if not top_picks.empty:
+                top_picks_summary = top_picks.to_string(index=False)
+                self.send_telegram_message(f"*Top 5 Picks*\n```\n{top_picks_summary}\n```")
             results_df.to_csv('trading_bot_summary.csv', index=False)
             logger.info("Summary saved to trading_bot_summary.csv")
         if self.failed_tickers:
@@ -534,7 +585,6 @@ class AdvancedSwingTradingBot:
             while True:
                 tz = pytz.timezone('Asia/Jerusalem')
                 now = datetime.now(tz)
-                # Check if running manually (GITHUB_EVENT_NAME is set by GitHub Actions)
                 is_manual_run = os.getenv('GITHUB_EVENT_NAME') == 'workflow_dispatch'
                 if is_manual_run:
                     logger.info(f"Manual run triggered at {now}. Running bot immediately...")
@@ -545,12 +595,12 @@ class AdvancedSwingTradingBot:
                 else:
                     logger.info(f"Not in trading hours: {now}. Skipping.")
                 logger.info("Waiting 60 minutes for next check...")
-                time.sleep(3600)  # 60 minutes
+                time.sleep(3600)
         except KeyboardInterrupt:
             logger.info("Bot stopped by user")
         except Exception as e:
             logger.error(f"Unexpected error in run_forever: {e}")
-            time.sleep(60)  # Retry after 1 min
+            time.sleep(60)
 
 if __name__ == "__main__":
     bot = AdvancedSwingTradingBot()
