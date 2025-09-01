@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Advanced Swing Trading Bot 10/10 – Single Run with Simplified Telegram Output
-Free, GitHub Actions ready, no TA-Lib, no Alpha Vantage, JSON tickers
+Advanced Swing Trading Bot 11/10 – Single Run, No Sentiment, Runs Anytime with Latest Prices
+Free, GitHub Actions ready, no TA-Lib, no external APIs, JSON tickers
 """
 
 import pandas as pd
@@ -14,12 +14,12 @@ import os
 import logging
 import json
 from typing import Dict, List, Optional
-from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
-from textblob import TextBlob
+import xgboost as xgb
 import matplotlib.pyplot as plt
 import pytz
+from multiprocessing import Pool, cpu_count
 
 # Logging
 logging.basicConfig(
@@ -38,7 +38,6 @@ class AdvancedSwingTradingBot:
         self.performance_history = []
         self.failed_tickers = []
         self.api_keys = {
-            'news_api': os.getenv('NEWS_API_KEY'),
             'telegram_bot': os.getenv('TELEGRAM_BOT_TOKEN'),
             'telegram_chat_id': os.getenv('TELEGRAM_CHAT_ID')
         }
@@ -72,6 +71,19 @@ class AdvancedSwingTradingBot:
             logger.warning(f"tickers.json not found. Using default tickers: {default_tickers}")
         return default_tickers
 
+    # ----------------- Check NYSE Trading Hours -----------------
+    def is_nyse_open(self) -> bool:
+        tz_ny = pytz.timezone('America/New_York')
+        now_ny = datetime.now(tz_ny)
+        
+        if now_ny.weekday() >= 5:
+            return False
+        
+        market_open = now_ny.replace(hour=9, minute=30, second=0, microsecond=0)
+        market_close = now_ny.replace(hour=16, minute=0, second=0, microsecond=0)
+        
+        return market_open <= now_ny <= market_close
+
     # ----------------- Fetch Data -----------------
     def fetch_stock_data(self, ticker: str, period: str = '6mo', interval: str = '1d') -> Optional[pd.DataFrame]:
         try:
@@ -79,17 +91,14 @@ class AdvancedSwingTradingBot:
             data = stock.history(period=period, interval=interval)
             if data.empty or len(data) < 50:
                 logger.warning(f"Insufficient data for {ticker} (rows: {len(data)})")
-                self.failed_tickers.append(ticker)
                 return None
             required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
             if not all(col in data.columns for col in required_columns):
                 logger.warning(f"Missing required columns for {ticker}: {data.columns}")
-                self.failed_tickers.append(ticker)
                 return None
             return data
         except Exception as e:
             logger.error(f"Error fetching data for {ticker}: {e}")
-            self.failed_tickers.append(ticker)
             return None
 
     # ----------------- Indicators -----------------
@@ -185,26 +194,6 @@ class AdvancedSwingTradingBot:
             logger.error(f"Error in ADX calculation: {e}")
             return pd.Series(0, index=df.index)
 
-    # ----------------- News Sentiment -----------------
-    def get_news_sentiment(self, ticker: str) -> float:
-        try:
-            if not self.api_keys['news_api']:
-                logger.warning(f"News API key missing for {ticker}. Using neutral sentiment. Get a key from https://newsapi.org/")
-                return 0.0
-            url = f"https://newsapi.org/v2/everything?q={ticker}&apiKey={self.api_keys['news_api']}&language=en&from={datetime.now().date() - timedelta(days=14)}"
-            response = requests.get(url)
-            response.raise_for_status()
-            articles = response.json().get('articles', [])[:10]
-            sentiments = []
-            for art in articles:
-                if art.get('title') and art.get('description'):
-                    text = f"{art['title']}. {art['description']}"
-                    sentiments.append(TextBlob(text).sentiment.polarity)
-            return np.mean(sentiments) if sentiments else 0.0
-        except Exception as e:
-            logger.error(f"Error in news sentiment for {ticker}: {e}")
-            return 0.0
-
     # ----------------- ML Features & Training -----------------
     def prepare_ml_features(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
         try:
@@ -272,6 +261,7 @@ class AdvancedSwingTradingBot:
         for ticker in self.tickers:
             df = self.fetch_stock_data(ticker)
             if df is None:
+                self.failed_tickers.append(ticker)
                 continue
             df = self.calculate_advanced_indicators(df)
             if df is None:
@@ -292,11 +282,11 @@ class AdvancedSwingTradingBot:
             self.scaler.fit(X_train)
             X_train_scaled = self.scaler.transform(X_train)
             X_test_scaled = self.scaler.transform(X_test)
-            self.model = GradientBoostingClassifier(n_estimators=100, learning_rate=0.1, max_depth=3, random_state=42)
+            self.model = xgb.XGBClassifier(n_estimators=200, learning_rate=0.1, max_depth=3, random_state=42, eval_metric='logloss')
             self.model.fit(X_train_scaled, y_train)
             train_score = self.model.score(X_train_scaled, y_train)
             test_score = self.model.score(X_test_scaled, y_test)
-            logger.info(f"ML Model trained - Train: {train_score:.2f}, Test: {test_score:.2f}")
+            logger.info(f"XGBoost Model trained - Train: {train_score:.2f}, Test: {test_score:.2f}")
             if self.failed_tickers:
                 logger.info(f"Failed tickers during ML training: {self.failed_tickers}")
         except Exception as e:
@@ -325,7 +315,7 @@ class AdvancedSwingTradingBot:
             latest = df.iloc[-1]
             if latest['EMA_20'] > latest['EMA_50'] > latest['EMA_200'] and latest['ADX'] > 25:
                 return "BUY"
-            elif latest['EMA_20'] < latest['EMA_50'] < latest['EMA_200']:
+            elif latest['EMA_20'] < latest['EMA_50'] < latest['EMA_200'] and latest['ADX'] > 25:
                 return "SELL"
             return "HOLD"
         except Exception as e:
@@ -337,9 +327,9 @@ class AdvancedSwingTradingBot:
             if len(df) < 50 or df['RSI'].isna().all() or df['BB_Lower'].isna().all() or df['BB_Upper'].isna().all():
                 return "HOLD"
             latest = df.iloc[-1]
-            if latest['RSI'] < 30 and latest['Close'] < latest['BB_Lower']:
+            if latest['RSI'] < 30 and latest['Close'] < latest['BB_Lower'] and latest['ADX'] > 25:
                 return "BUY"
-            elif latest['RSI'] > 70 and latest['Close'] > latest['BB_Upper']:
+            elif latest['RSI'] > 70 and latest['Close'] > latest['BB_Upper'] and latest['ADX'] > 25:
                 return "SELL"
             return "HOLD"
         except Exception as e:
@@ -353,9 +343,9 @@ class AdvancedSwingTradingBot:
             latest = df.iloc[-1]
             high_20 = df['High'].rolling(20).max().iloc[-2]
             low_20 = df['Low'].rolling(20).min().iloc[-2]
-            if latest['Close'] > high_20:
+            if latest['Close'] > high_20 and latest['ADX'] > 25:
                 return "BUY"
-            elif latest['Close'] < low_20:
+            elif latest['Close'] < low_20 and latest['ADX'] > 25:
                 return "SELL"
             return "HOLD"
         except Exception as e:
@@ -400,17 +390,34 @@ class AdvancedSwingTradingBot:
             logger.error(f"Telegram send error: {e}")
 
     # ----------------- Visualization -----------------
-    def visualize_signals(self, df: pd.DataFrame, ticker: str):
+    def visualize_signals(self, df: pd.DataFrame, ticker: str, final_signal: str):
         try:
-            if df['Close'].isna().all() or df['EMA_20'].isna().all() or df['EMA_50'].isna().all():
+            if df['Close'].isna().all() or df['EMA_20'].isna().all() or df['EMA_50'].isna().all() or df['RSI'].isna().all():
                 logger.warning(f"Invalid data for visualization in {ticker}")
                 return
-            plt.figure(figsize=(12, 6))
-            plt.plot(df['Close'], label='Close', color='blue')
-            plt.plot(df['EMA_20'], label='EMA 20', color='green')
-            plt.plot(df['EMA_50'], label='EMA 50', color='red')
-            plt.title(f"{ticker} Price & EMA")
-            plt.legend()
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), gridspec_kw={'height_ratios': [3, 1]})
+            
+            # Price and EMA plot
+            ax1.plot(df.index, df['Close'], label='Close', color='blue')
+            ax1.plot(df.index, df['EMA_20'], label='EMA 20', color='green')
+            ax1.plot(df.index, df['EMA_50'], label='EMA 50', color='red')
+            if final_signal == "BUY":
+                ax1.scatter(df.index[-1], df['Close'].iloc[-1], color='green', marker='^', s=100, label='BUY Signal')
+            elif final_signal == "SELL":
+                ax1.scatter(df.index[-1], df['Close'].iloc[-1], color='red', marker='v', s=100, label='SELL Signal')
+            ax1.set_title(f"{ticker} Price & EMA with Signals")
+            ax1.legend()
+            ax1.grid(True)
+            
+            # RSI plot
+            ax2.plot(df.index, df['RSI'], label='RSI', color='purple')
+            ax2.axhline(70, linestyle='--', alpha=0.5, color='red')
+            ax2.axhline(30, linestyle='--', alpha=0.5, color='green')
+            ax2.set_title("RSI")
+            ax2.legend()
+            ax2.grid(True)
+            
+            plt.tight_layout()
             plt.savefig(f"{ticker}_chart.png")
             plt.close()
             logger.info(f"Chart saved: {ticker}_chart.png")
@@ -469,105 +476,116 @@ class AdvancedSwingTradingBot:
             logger.error(f"Error calculating trade details: {e}")
             return {"Entry_Price": 0.0, "Take_Profit": 0.0, "Stop_Loss": 0.0}
 
+    # ----------------- Process Single Ticker -----------------
+    def process_ticker(self, ticker: str) -> Optional[Dict]:
+        try:
+            df = self.fetch_stock_data(ticker)
+            if df is None:
+                self.failed_tickers.append(ticker)
+                return None
+            df = self.calculate_advanced_indicators(df)
+            if df is None:
+                self.failed_tickers.append(ticker)
+                return None
+            signal_trend = self.strategy_trend_following(df)
+            signal_mean = self.strategy_mean_reversion(df)
+            signal_breakout = self.strategy_breakout(df)
+            signal_ml = self.get_ml_signal(df)
+            signals = [signal_trend, signal_mean, signal_breakout, signal_ml]
+            final_signal = max(set(signals), key=signals.count)
+            backtest_trend = self.backtest_strategy(df, self.strategy_trend_following)
+            backtest_mean = self.backtest_strategy(df, self.strategy_mean_reversion)
+            backtest_breakout = self.backtest_strategy(df, self.strategy_breakout)
+            trade_details = self.calculate_trade_details(df, final_signal)
+            logger.info(
+                f"Processing {ticker}:\n"
+                f"  Signal: {final_signal} (ML: {signal_ml})\n"
+                f"  Trend: {signal_trend}, Mean: {signal_mean}, Breakout: {signal_breakout}\n"
+                f"  Backtest: Trend {backtest_trend['Total_Return']:.2f} (Win: {backtest_trend['Win_Rate']:.2f}), "
+                f"Mean {backtest_mean['Total_Return']:.2f} (Win: {backtest_mean['Win_Rate']:.2f}), "
+                f"Breakout {backtest_breakout['Total_Return']:.2f} (Win: {backtest_breakout['Win_Rate']:.2f})\n"
+                f"  Trade: Entry ${trade_details['Entry_Price']:.2f}, TP ${trade_details['Take_Profit']:.2f}, SL ${trade_details['Stop_Loss']:.2f}"
+            )
+            result = {
+                'Ticker': ticker,
+                'Final_Signal': final_signal,
+                'ML_Signal': signal_ml,
+                'Trend_Signal': signal_trend,
+                'Mean_Signal': signal_mean,
+                'Breakout_Signal': signal_breakout,
+                'Backtest_Trend': backtest_trend['Total_Return'],
+                'Backtest_Trend_Win': backtest_trend['Win_Rate'],
+                'Backtest_Mean': backtest_mean['Total_Return'],
+                'Backtest_Mean_Win': backtest_mean['Win_Rate'],
+                'Backtest_Breakout': backtest_breakout['Total_Return'],
+                'Backtest_Breakout_Win': backtest_breakout['Win_Rate'],
+                'Entry_Price': trade_details['Entry_Price'],
+                'Take_Profit': trade_details['Take_Profit'],
+                'Stop_Loss': trade_details['Stop_Loss']
+            }
+            if final_signal != "HOLD":
+                weighted_score = (
+                    0.6 * max(backtest_trend['Total_Return'], backtest_mean['Total_Return'], backtest_breakout['Total_Return']) +
+                    0.4 * max(backtest_trend['Win_Rate'], backtest_mean['Win_Rate'], backtest_breakout['Win_Rate'])
+                )
+                if (max(backtest_trend['Total_Return'], backtest_mean['Total_Return'], backtest_breakout['Total_Return']) > 0.05 and
+                    max(backtest_trend['Win_Rate'], backtest_mean['Win_Rate'], backtest_breakout['Win_Rate']) > 0.7):
+                    win_rate = max(
+                        (backtest_trend['Win_Rate'] if signal_trend == final_signal else 0),
+                        (backtest_mean['Win_Rate'] if signal_mean == final_signal else 0),
+                        (backtest_breakout['Win_Rate'] if signal_breakout == final_signal else 0)
+                    )
+                    message = (
+                        f"*{ticker}* - *{final_signal}*\n"
+                        f"Entry: ${trade_details['Entry_Price']:.2f}\n"
+                        f"Take Profit: ${trade_details['Take_Profit']:.2f}\n"
+                        f"Stop Loss: ${trade_details['Stop_Loss']:.2f}\n"
+                        f"Win Rate: {win_rate*100:.1f}%"
+                    )
+                    self.send_telegram_message(message)
+            self.visualize_signals(df, ticker, final_signal)
+            return result
+        except Exception as e:
+            logger.error(f"Error processing {ticker}: {e}")
+            self.failed_tickers.append(ticker)
+            return None
+
     # ----------------- Run Bot -----------------
     def run_once(self):
-        tz = pytz.timezone('Asia/Jerusalem')
-        now = datetime.now(tz)
+        tz_ist = pytz.timezone('Asia/Jerusalem')
+        now_ist = datetime.now(tz_ist)
         is_manual_run = os.getenv('GITHUB_EVENT_NAME') == 'workflow_dispatch'
-        if not is_manual_run and (now.weekday() not in [0, 1, 2, 3, 4] or not (15 <= now.hour <= 23)):
-            logger.info(f"Not in trading hours: {now}. Exiting.")
-            self.send_telegram_message(f"*Trading Bot*\nNot in trading hours: {now}. No analysis performed.")
-            return
-
-        logger.info("Starting Advanced Swing Trading Bot - Single Run")
+        is_nyse_open = self.is_nyse_open()
+        market_status = "open" if is_nyse_open else "closed, using latest available prices"
+        
+        logger.info(f"Starting Advanced Swing Trading Bot - Single Run (NYSE {market_status})")
+        self.send_telegram_message(
+            f"*Trading Bot*\nRun started at {now_ist}. NYSE is {market_status}."
+        )
         self.failed_tickers = []
         results = []
-        for ticker in self.tickers:
-            try:
-                df = self.fetch_stock_data(ticker)
-                if df is None:
-                    continue
-                df = self.calculate_advanced_indicators(df)
-                if df is None:
-                    self.failed_tickers.append(ticker)
-                    continue
-                signal_trend = self.strategy_trend_following(df)
-                signal_mean = self.strategy_mean_reversion(df)
-                signal_breakout = self.strategy_breakout(df)
-                signal_ml = self.get_ml_signal(df)
-                signals = [signal_trend, signal_mean, signal_breakout, signal_ml]
-                final_signal = max(set(signals), key=signals.count)
-                sentiment_news = self.get_news_sentiment(ticker)
-                backtest_trend = self.backtest_strategy(df, self.strategy_trend_following)
-                backtest_mean = self.backtest_strategy(df, self.strategy_mean_reversion)
-                backtest_breakout = self.backtest_strategy(df, self.strategy_breakout)
-                trade_details = self.calculate_trade_details(df, final_signal)
-                logger.info(
-                    f"Processing {ticker}:\n"
-                    f"  Signal: {final_signal} (ML: {signal_ml})\n"
-                    f"  Trend: {signal_trend}, Mean: {signal_mean}, Breakout: {signal_breakout}\n"
-                    f"  News Sentiment: {sentiment_news:.2f}\n"
-                    f"  Backtest: Trend {backtest_trend['Total_Return']:.2f} (Win: {backtest_trend['Win_Rate']:.2f}), "
-                    f"Mean {backtest_mean['Total_Return']:.2f} (Win: {backtest_mean['Win_Rate']:.2f}), "
-                    f"Breakout {backtest_breakout['Total_Return']:.2f} (Win: {backtest_breakout['Win_Rate']:.2f})\n"
-                    f"  Trade: Entry ${trade_details['Entry_Price']:.2f}, TP ${trade_details['Take_Profit']:.2f}, SL ${trade_details['Stop_Loss']:.2f}"
-                )
-                result = {
-                    'Ticker': ticker,
-                    'Final_Signal': final_signal,
-                    'ML_Signal': signal_ml,
-                    'Trend_Signal': signal_trend,
-                    'Mean_Signal': signal_mean,
-                    'Breakout_Signal': signal_breakout,
-                    'News_Sentiment': sentiment_news,
-                    'Backtest_Trend': backtest_trend['Total_Return'],
-                    'Backtest_Trend_Win': backtest_trend['Win_Rate'],
-                    'Backtest_Mean': backtest_mean['Total_Return'],
-                    'Backtest_Mean_Win': backtest_mean['Win_Rate'],
-                    'Backtest_Breakout': backtest_breakout['Total_Return'],
-                    'Backtest_Breakout_Win': backtest_breakout['Win_Rate'],
-                    'Entry_Price': trade_details['Entry_Price'],
-                    'Take_Profit': trade_details['Take_Profit'],
-                    'Stop_Loss': trade_details['Stop_Loss']
-                }
-                results.append(result)
-                if final_signal != "HOLD":
-                    weighted_score = (
-                        0.4 * max(backtest_trend['Total_Return'], backtest_mean['Total_Return'], backtest_breakout['Total_Return']) +
-                        0.3 * max(backtest_trend['Win_Rate'], backtest_mean['Win_Rate'], backtest_breakout['Win_Rate']) +
-                        0.3 * abs(sentiment_news)
-                    )
-                    if (final_signal == "BUY" and sentiment_news > 0.1) or (final_signal == "SELL" and sentiment_news < -0.1):
-                        if max(backtest_trend['Total_Return'], backtest_mean['Total_Return'], backtest_breakout['Total_Return']) > 0.05:
-                            if max(backtest_trend['Win_Rate'], backtest_mean['Win_Rate'], backtest_breakout['Win_Rate']) > 0.6:
-                                win_rate = max(
-                                    (backtest_trend['Win_Rate'] if signal_trend == final_signal else 0),
-                                    (backtest_mean['Win_Rate'] if signal_mean == final_signal else 0),
-                                    (backtest_breakout['Win_Rate'] if signal_breakout == final_signal else 0)
-                                )
-                                message = (
-                                    f"*{ticker}* - *{final_signal}*\n"
-                                    f"Entry: ${trade_details['Entry_Price']:.2f}\n"
-                                    f"Take Profit: ${trade_details['Take_Profit']:.2f}\n"
-                                    f"Stop Loss: ${trade_details['Stop_Loss']:.2f}\n"
-                                    f"Win Rate: {win_rate*100:.1f}%"
-                                )
-                                self.send_telegram_message(message)
-                self.visualize_signals(df, ticker)
-                time.sleep(0.1)
-            except Exception as e:
-                logger.error(f"Error processing {ticker}: {e}")
-                self.failed_tickers.append(ticker)
+        
+        # Parallel processing of tickers
+        with Pool(processes=cpu_count()) as pool:
+            results = pool.map(self.process_ticker, self.tickers)
+        results = [r for r in results if r is not None]
+
         if results:
             results_df = pd.DataFrame(results)
             results_df['Weighted_Score'] = (
-                0.4 * results_df[['Backtest_Trend', 'Backtest_Mean', 'Backtest_Breakout']].max(axis=1) +
-                0.3 * results_df[['Backtest_Trend_Win', 'Backtest_Mean_Win', 'Backtest_Breakout_Win']].max(axis=1) +
-                0.3 * results_df['News_Sentiment'].abs()
+                0.6 * results_df[['Backtest_Trend', 'Backtest_Mean', 'Backtest_Breakout']].max(axis=1) +
+                0.4 * results_df[['Backtest_Trend_Win', 'Backtest_Mean_Win', 'Backtest_Breakout_Win']].max(axis=1)
             )
             top_picks = results_df[results_df['Final_Signal'] != "HOLD"].sort_values(by='Weighted_Score', ascending=False).head(5)
             if not top_picks.empty:
-                summary_message = f"*Top 5 Trading Picks for {datetime.now().date()}*\n"
+                avg_return = top_picks[['Backtest_Trend', 'Backtest_Mean', 'Backtest_Breakout']].max(axis=1).mean()
+                avg_win_rate = top_picks[['Backtest_Trend_Win', 'Backtest_Mean_Win', 'Backtest_Breakout_Win']].max(axis=1).mean()
+                summary_message = (
+                    f"*Top 5 Trading Picks for {datetime.now().date()}*\n"
+                    f"*Market Status*: NYSE {market_status}\n"
+                    f"*Average Return*: {avg_return*100:.1f}%\n"
+                    f"*Average Win Rate*: {avg_win_rate*100:.1f}%\n\n"
+                )
                 for idx, row in top_picks.iterrows():
                     win_rate = max(
                         (row['Backtest_Trend_Win'] if row['Trend_Signal'] == row['Final_Signal'] else 0),
