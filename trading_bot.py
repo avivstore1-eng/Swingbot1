@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Advanced Swing Trading Bot 10/10 – Full Version with Simplified Telegram Output
+Advanced Swing Trading Bot 10/10 – Single Run with Simplified Telegram Output
 Free, GitHub Actions ready, no TA-Lib, no Alpha Vantage, JSON tickers
 """
 
@@ -471,6 +471,14 @@ class AdvancedSwingTradingBot:
 
     # ----------------- Run Bot -----------------
     def run_once(self):
+        tz = pytz.timezone('Asia/Jerusalem')
+        now = datetime.now(tz)
+        is_manual_run = os.getenv('GITHUB_EVENT_NAME') == 'workflow_dispatch'
+        if not is_manual_run and (now.weekday() not in [0, 1, 2, 3, 4] or not (15 <= now.hour <= 23)):
+            logger.info(f"Not in trading hours: {now}. Exiting.")
+            self.send_telegram_message(f"*Trading Bot*\nNot in trading hours: {now}. No analysis performed.")
+            return
+
         logger.info("Starting Advanced Swing Trading Bot - Single Run")
         self.failed_tickers = []
         results = []
@@ -504,7 +512,6 @@ class AdvancedSwingTradingBot:
                     f"Breakout {backtest_breakout['Total_Return']:.2f} (Win: {backtest_breakout['Win_Rate']:.2f})\n"
                     f"  Trade: Entry ${trade_details['Entry_Price']:.2f}, TP ${trade_details['Take_Profit']:.2f}, SL ${trade_details['Stop_Loss']:.2f}"
                 )
-                # Collect result for summary and filtering
                 result = {
                     'Ticker': ticker,
                     'Final_Signal': final_signal,
@@ -524,7 +531,6 @@ class AdvancedSwingTradingBot:
                     'Stop_Loss': trade_details['Stop_Loss']
                 }
                 results.append(result)
-                # Send Telegram message only for top picks
                 if final_signal != "HOLD":
                     weighted_score = (
                         0.4 * max(backtest_trend['Total_Return'], backtest_mean['Total_Return'], backtest_breakout['Total_Return']) +
@@ -552,17 +558,14 @@ class AdvancedSwingTradingBot:
             except Exception as e:
                 logger.error(f"Error processing {ticker}: {e}")
                 self.failed_tickers.append(ticker)
-        # Create and save summary
         if results:
             results_df = pd.DataFrame(results)
-            # Sort by weighted score for top picks
             results_df['Weighted_Score'] = (
                 0.4 * results_df[['Backtest_Trend', 'Backtest_Mean', 'Backtest_Breakout']].max(axis=1) +
                 0.3 * results_df[['Backtest_Trend_Win', 'Backtest_Mean_Win', 'Backtest_Breakout_Win']].max(axis=1) +
                 0.3 * results_df['News_Sentiment'].abs()
             )
             top_picks = results_df[results_df['Final_Signal'] != "HOLD"].sort_values(by='Weighted_Score', ascending=False).head(5)
-            # Create simplified Telegram summary for top picks
             if not top_picks.empty:
                 summary_message = f"*Top 5 Trading Picks for {datetime.now().date()}*\n"
                 for idx, row in top_picks.iterrows():
@@ -587,29 +590,6 @@ class AdvancedSwingTradingBot:
             self.send_telegram_message(f"*Failed Tickers*\n{self.failed_tickers}")
         logger.info("Single run completed.")
 
-    def run_forever(self):
-        logger.info("Starting bot in continuous mode - Checks every 60 minutes")
-        try:
-            while True:
-                tz = pytz.timezone('Asia/Jerusalem')
-                now = datetime.now(tz)
-                is_manual_run = os.getenv('GITHUB_EVENT_NAME') == 'workflow_dispatch'
-                if is_manual_run:
-                    logger.info(f"Manual run triggered at {now}. Running bot immediately...")
-                    self.run_once()
-                elif now.weekday() in [0, 1, 2, 3, 4] and 15 <= now.hour <= 23:
-                    logger.info(f"Trading hours: {now}. Running bot...")
-                    self.run_once()
-                else:
-                    logger.info(f"Not in trading hours: {now}. Skipping.")
-                logger.info("Waiting 60 minutes for next check...")
-                time.sleep(3600)
-        except KeyboardInterrupt:
-            logger.info("Bot stopped by user")
-        except Exception as e:
-            logger.error(f"Unexpected error in run_forever: {e}")
-            time.sleep(60)
-
 if __name__ == "__main__":
     bot = AdvancedSwingTradingBot()
-    bot.run_forever()
+    bot.run_once()
