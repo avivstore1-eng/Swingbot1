@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Advanced Swing Trading Bot – גרסת 9.4/10 (חינמי) בעברית
-- ריצה מלאה על *כל* הטיקרים (גם שוק פתוח וגם סגור)
-- ML עם TimeSeriesSplit + EarlyStopping (תמיכה דינמית בגרסאות xgboost)
-- Persist לקול־דאון בין ריצות (JSON)
-- Backtest רב־יומי עם עלויות + דוח חודשי (CSV + גרף)
-- פילטר מצב־שוק (SPY), סינון נזילות/מחיר, דירוג EV
-- ATR sizing, Trailing Stop, חשיפת פורטפוליו דינמית, Cooldown
-- מקביליות + קאש יומי + Backoff ל-yfinance
-- התראות טלגרם בעברית (אופציונלי)
+Advanced Swing Trading Bot – גרסת 10.0 (חינמי) בעברית
+- עם 5 אסטרטגיות נוספות לשיפור כיסוי השוק
+- ריצה מלאה על *כל* הטיקרים
 """
 
 import os
@@ -21,7 +15,7 @@ import hashlib
 import logging
 import inspect
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -38,9 +32,6 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
-# אפשר להשאיר - שימושי להשוואות גרסאות (לא חובה בכל מסלול)
-from packaging import version as _pkg_version
 
 # ===================== תצורה גלובלית =====================
 
@@ -82,7 +73,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logging.getLogger("yfinance").setLevel(logging.WARNING)
 
-
 # ===================== עזר =====================
 
 def send_telegram_message(message: str):
@@ -101,12 +91,10 @@ def send_telegram_message(message: str):
     except Exception as e:
         logger.error(f"שגיאת שליחת טלגרם: {e}")
 
-
 def load_tickers() -> List[str]:
-    """טעינת טיקרים מ-tickers.json (ניקוי סימנים בעייתיים, כפילויות, תווים)."""
+    """טעינת טיקרים מ-tickers.json"""
     blacklist = {"ANSS"}
-    test_tickers = ["AAPL", "MSFT", "GOOGL"]
-    default_tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "META"]
+    default_tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "NVDA", "JPM", "JNJ", "V"]
 
     def _clean(sym: str) -> Optional[str]:
         if not isinstance(sym, str):
@@ -137,8 +125,7 @@ def load_tickers() -> List[str]:
             return default_tickers
     else:
         logger.warning("tickers.json לא נמצא. משתמש ברשימת בדיקה.")
-        return test_tickers
-
+        return default_tickers
 
 def _load_cooldown_state() -> Dict[str, Dict[str, str]]:
     try:
@@ -149,7 +136,6 @@ def _load_cooldown_state() -> Dict[str, Dict[str, str]]:
         logger.warning(f"שגיאה בטעינת COOLDOWN_FILE: {e}")
     return {}
 
-
 def _save_cooldown_state(state: Dict[str, Dict[str, str]]):
     try:
         with open(COOLDOWN_FILE, "w", encoding="utf-8") as f:
@@ -157,9 +143,8 @@ def _save_cooldown_state(state: Dict[str, Dict[str, str]]):
     except Exception as e:
         logger.warning(f"שגיאה בשמירת COOLDOWN_FILE: {e}")
 
-
 def is_nyse_holiday(date_obj: datetime.date) -> bool:
-    """חגים עיקריים של NYSE לשנים 2024–2026 (קירוב ללא תלות חיצונית)."""
+    """חגים עיקריים של NYSE"""
     def nth_weekday(year, month, weekday, n):
         d = datetime(year, month, 1)
         offset = (weekday - d.weekday()) % 7
@@ -193,9 +178,8 @@ def is_nyse_holiday(date_obj: datetime.date) -> bool:
 
     return date_obj in holidays
 
-
 def is_nyse_open_now() -> bool:
-    """בדיקת פתיחת שוק פשוטה (ללא תלות חיצונית)."""
+    """בדיקת פתיחת שוק פשוטה"""
     try:
         tz_ny = pytz.timezone("America/New_York")
         now = datetime.now(tz_ny)
@@ -210,10 +194,8 @@ def is_nyse_open_now() -> bool:
         logger.error(f"שגיאה בבדיקת פתיחת NYSE: {e}")
         return False
 
-
 def safe_cache_key(*parts: str) -> str:
     return hashlib.md5("::".join(parts).encode()).hexdigest()
-
 
 # ===================== אינדיקטורים =====================
 
@@ -231,7 +213,6 @@ def compute_RSI(series: pd.Series, period: int = 14) -> pd.Series:
         logger.error(f"שגיאת RSI: {e}")
         return pd.Series(50, index=series.index)
 
-
 def compute_MACD(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
     try:
         fast_ema = series.ewm(span=fast, adjust=False).mean()
@@ -244,7 +225,6 @@ def compute_MACD(series: pd.Series, fast: int = 12, slow: int = 26, signal: int 
         logger.error(f"שגיאת MACD: {e}")
         idx = series.index
         return pd.Series(0, index=idx), pd.Series(0, index=idx), pd.Series(0, index=idx)
-
 
 def compute_stochastic(df: pd.DataFrame, k_period: int = 14, d_period: int = 3):
     try:
@@ -259,7 +239,6 @@ def compute_stochastic(df: pd.DataFrame, k_period: int = 14, d_period: int = 3):
         idx = df.index
         return pd.Series(50, index=idx), pd.Series(50, index=idx)
 
-
 def compute_ATR(df: pd.DataFrame, period: int = 14):
     try:
         high_low = df["High"] - df["Low"]
@@ -272,9 +251,8 @@ def compute_ATR(df: pd.DataFrame, period: int = 14):
         logger.error(f"שגיאת ATR: {e}")
         return pd.Series(0, index=df.index)
 
-
 def compute_ADX(df: pd.DataFrame, period: int = 14):
-    """ADX לפי ווילדר (מדויק)."""
+    """ADX לפי ווילדר"""
     try:
         high = df["High"]
         low = df["Low"]
@@ -303,7 +281,6 @@ def compute_ADX(df: pd.DataFrame, period: int = 14):
     except Exception as e:
         logger.error(f"שגיאת ADX: {e}")
         return pd.Series(0, index=df.index)
-
 
 def calculate_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     try:
@@ -339,13 +316,12 @@ def calculate_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         logger.error(f"שגיאה בחישוב אינדיקטורים: {e}")
         return None
 
-
 # ===================== נתונים + קאש =====================
 
 _data_cache: Dict[str, Dict] = {}
 
 def fetch_stock_data(ticker: str, period: str = "6mo", interval: str = "1d") -> Optional[pd.DataFrame]:
-    """משיכת נתוני yfinance עם קאש יומי (חינמי) + backoff אדפטיבי."""
+    """משיכת נתוני yfinance עם קאש יומי"""
     try:
         cache_key = safe_cache_key(ticker, period, interval)
         cache_file = f"{CACHE_PREFIX}{cache_key}.pkl"
@@ -375,7 +351,6 @@ def fetch_stock_data(ticker: str, period: str = "6mo", interval: str = "1d") -> 
                     try:
                         with open(cache_file, "wb") as f:
                             pickle.dump(obj, f)
-                        # הצלחה -> אין צורך להמשיך
                     except Exception as e:
                         logger.warning(f"שגיאת שמירת קאש עבור {ticker}: {e}")
                     return df
@@ -393,7 +368,6 @@ def fetch_stock_data(ticker: str, period: str = "6mo", interval: str = "1d") -> 
     except Exception as e:
         logger.error(f"שגיאה בשליפת נתונים ל-{ticker}: {e}")
         return None
-
 
 # ===================== ML =====================
 
@@ -421,7 +395,6 @@ def prepare_ml_features(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     except Exception as e:
         logger.error(f"שגיאת הכנת מאפייני ML: {e}")
         return None
-
 
 def prepare_ml_dataset(df: pd.DataFrame):
     try:
@@ -458,10 +431,8 @@ def prepare_ml_dataset(df: pd.DataFrame):
         logger.error(f"שגיאת בניית דסייט ML: {e}")
         return pd.DataFrame(), pd.Series(dtype="int64")
 
-
 def load_or_train_model(tickers: List[str]):
-    """שומר/טוען מודל כדי לחסוך זמן ב-CI. אימון על *כל* הטיקרים (חינמי) עם TimeSeriesSplit.
-       כולל זיהוי-יכולות דינמי ל-xgboost.fit (callbacks / early_stopping_rounds)."""
+    """שומר/טוען מודל"""
     model = None
     scaler = None
 
@@ -509,7 +480,6 @@ def load_or_train_model(tickers: List[str]):
     best_score = -1e9
     best_scaler = None
 
-    # בדיקת אילו פרמטרים נתמכים בפועל על-ידי fit()
     try:
         fit_sig = inspect.signature(xgb.XGBClassifier.fit)
         supports_callbacks = "callbacks" in fit_sig.parameters
@@ -527,14 +497,14 @@ def load_or_train_model(tickers: List[str]):
         X_test_s  = scaler.transform(X_test)
 
         model = xgb.XGBClassifier(
-            n_estimators=220,            # מעט יותר עצים כדי לפצות אם אין EarlyStopping
+            n_estimators=220,
             learning_rate=0.07,
             max_depth=4,
             subsample=0.9,
             colsample_bytree=0.9,
             random_state=42 + fold,
             n_jobs=2,
-            eval_metric="logloss"       # להציב בקונסטרקטור – נתמך בכל הגרסאות המודרניות
+            eval_metric="logloss"
         )
 
         fit_kwargs = {
@@ -542,11 +512,9 @@ def load_or_train_model(tickers: List[str]):
             "verbose": False
         }
 
-        # אם הגרסה תומכת ב-early_stopping_rounds – נשתמש בו
         if supports_esr:
             fit_kwargs["early_stopping_rounds"] = 30
 
-        # אם הגרסה תומכת ב-callbacks – נשתמש ב-EarlyStopping (xgboost >= 2.0)
         if supports_callbacks:
             try:
                 cb = xgb.callback.EarlyStopping(
@@ -562,7 +530,6 @@ def load_or_train_model(tickers: List[str]):
         try:
             model.fit(X_train_s, y_train, **fit_kwargs)
         except TypeError as te:
-            # אם חרף הזיהוי עדיין נפל – ננסה ללא callbacks / ESR
             logger.warning(f"ניסיון fit ללא פרמטרים מתקדמים בעקבות TypeError: {te}")
             model.fit(X_train_s, y_train, eval_set=[(X_test_s, y_test)], verbose=False)
 
@@ -587,7 +554,6 @@ def load_or_train_model(tickers: List[str]):
 
     return model, scaler
 
-
 # ===================== אסטרטגיות =====================
 
 def strategy_trend_following(df: pd.DataFrame) -> str:
@@ -604,7 +570,6 @@ def strategy_trend_following(df: pd.DataFrame) -> str:
         logger.error(f"שגיאה באסטרטגיית טרנד: {e}")
         return "HOLD"
 
-
 def strategy_mean_reversion(df: pd.DataFrame) -> str:
     try:
         if len(df) < 50:
@@ -618,7 +583,6 @@ def strategy_mean_reversion(df: pd.DataFrame) -> str:
     except Exception as e:
         logger.error(f"שגיאה באסטרטגיית ממוצע חוזר: {e}")
         return "HOLD"
-
 
 def strategy_breakout(df: pd.DataFrame) -> str:
     try:
@@ -636,6 +600,114 @@ def strategy_breakout(df: pd.DataFrame) -> str:
         logger.error(f"שגיאה באסטרטגיית פריצה: {e}")
         return "HOLD"
 
+def strategy_volume_spike(df: pd.DataFrame) -> str:
+    """איתות על בסיס נפח חריג - נפח היום גבוה ב-250% מהממוצע 20 יום"""
+    try:
+        if len(df) < 21:
+            return "HOLD"
+        
+        latest = df.iloc[-1]
+        volume_ratio = latest["Volume"] / latest["Volume_MA"]
+        
+        if volume_ratio > 2.5 and latest["Close"] > latest["Open"]:
+            return "BUY"
+        elif volume_ratio > 2.5 and latest["Close"] < latest["Open"]:
+            return "SELL"
+            
+        return "HOLD"
+    except Exception as e:
+        logger.error(f"שגיאה באסטרטגיית נפח: {e}")
+        return "HOLD"
+
+def strategy_gap_trading(df: pd.DataFrame) -> str:
+    """מסחר בפערים - גאפ מעל 2% מהסגירה הקודמת"""
+    try:
+        if len(df) < 2:
+            return "HOLD"
+            
+        prev_close = df["Close"].iloc[-2]
+        current_open = df["Open"].iloc[-1]
+        gap_percent = abs(current_open / prev_close - 1)
+        
+        if gap_percent > 0.02:
+            if current_open > prev_close:  # גאפ למעלה
+                return "BUY" if df["Close"].iloc[-1] > current_open else "HOLD"
+            else:  # גאפ למטה
+                return "SELL" if df["Close"].iloc[-1] < current_open else "HOLD"
+                
+        return "HOLD"
+    except Exception as e:
+        logger.error(f"שגיאה באסטרטגיית גאפים: {e}")
+        return "HOLD"
+
+def strategy_support_resistance(df: pd.DataFrame) -> str:
+    """זיהוי פריצת תמיכה/התנגדות - based on 20-day high/low"""
+    try:
+        if len(df) < 21:
+            return "HOLD"
+            
+        latest = df.iloc[-1]
+        prev_high = df["High"].iloc[-21:-1].max()
+        prev_low = df["Low"].iloc[-21:-1].min()
+        
+        if latest["Close"] > prev_high and latest["Volume"] > latest["Volume_MA"]:
+            return "BUY"
+        elif latest["Close"] < prev_low and latest["Volume"] > latest["Volume_MA"]:
+            return "SELL"
+            
+        return "HOLD"
+    except Exception as e:
+        logger.error(f"שגיאה באסטרטגיית תמיכה/התנגדות: {e}")
+        return "HOLD"
+
+def strategy_rsi_divergence(df: pd.DataFrame) -> str:
+    """זיהוי דיברגנס בין מחיר ל-RSI"""
+    try:
+        if len(df) < 14:
+            return "HOLD"
+            
+        # חיפוש דיברגנס חיובי (מחיר יורד, RSI עולה)
+        price_trend = df["Close"].iloc[-5:].mean() < df["Close"].iloc[-10:-5].mean()
+        rsi_trend = df["RSI"].iloc[-5:].mean() > df["RSI"].iloc[-10:-5].mean()
+        
+        if price_trend and rsi_trend and df["RSI"].iloc[-1] < 40:
+            return "BUY"
+            
+        # חיפוש דיברגנס שלילי (מחיר עולה, RSI יורד)
+        price_trend = df["Close"].iloc[-5:].mean() > df["Close"].iloc[-10:-5].mean()
+        rsi_trend = df["RSI"].iloc[-5:].mean() < df["RSI"].iloc[-10:-5].mean()
+        
+        if price_trend and rsi_trend and df["RSI"].iloc[-1] > 60:
+            return "SELL"
+            
+        return "HOLD"
+    except Exception as e:
+        logger.error(f"שגיאה באסטרטגיית דיברגנס: {e}")
+        return "HOLD"
+
+def strategy_momentum_reversal(df: pd.DataFrame) -> str:
+    """זיהוי היפוך מומנטום based on RSI וסטוכסטיק"""
+    try:
+        if len(df) < 14:
+            return "HOLD"
+            
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+        
+        # היפוך ממצב oversold
+        if (latest["RSI"] > 30 and prev["RSI"] <= 30 and 
+            latest["SlowK"] > 20 and prev["SlowK"] <= 20):
+            return "BUY"
+            
+        # היפוך ממצב overbought
+        if (latest["RSI"] < 70 and prev["RSI"] >= 70 and 
+            latest["SlowK"] < 80 and prev["SlowK"] >= 80):
+            return "SELL"
+            
+        return "HOLD"
+    except Exception as e:
+        logger.error(f"שגיאה באסטרטגיית היפוך מומנטום: {e}")
+        return "HOLD"
 
 def vote_final_signal(signals: List[str]) -> str:
     """הצבעה משופרת: צריך לפחות שני BUY/SELL כדי לנצח HOLD."""
@@ -643,7 +715,6 @@ def vote_final_signal(signals: List[str]) -> str:
     if max(votes["BUY"], votes["SELL"]) >= 2:
         return "BUY" if votes["BUY"] > votes["SELL"] else "SELL"
     return "HOLD"
-
 
 # ===================== פילטרי "רווח מקסימלי" =====================
 
@@ -658,7 +729,6 @@ def market_regime_long_allowed() -> bool:
     latest = spy.iloc[-1]
     return bool(latest["EMA_20"] > latest["EMA_50"])
 
-
 def market_regime_short_allowed() -> bool:
     """שורטים רק כשה-SPY במגמת ירידה בסיסית (EMA20<EMA50)."""
     spy = fetch_stock_data("SPY", period="6mo", interval="1d")
@@ -670,7 +740,6 @@ def market_regime_short_allowed() -> bool:
     latest = spy.iloc[-1]
     return bool(latest["EMA_20"] < latest["EMA_50"])
 
-
 def passes_liquidity_filter(df: pd.DataFrame) -> bool:
     """נזילות/מחיר: מחיר >$5 ונפח ממוצע 20 יום > 300k."""
     try:
@@ -681,13 +750,11 @@ def passes_liquidity_filter(df: pd.DataFrame) -> bool:
     except Exception:
         return False
 
-
 # ===================== Backtest + דירוג EV =====================
 
 def backtest_day_ahead(df: pd.DataFrame, strategy_func) -> Dict[str, float]:
     """
-    Backtest יומי קדימה: מחזיר WinRate, ממוצע חיובי/שלילי וה-EV (חישוב גס).
-    EV ≈ p*avg_pos - (1-p)*avg_neg
+    Backtest יומי קדימה
     """
     try:
         if len(df) < 50:
@@ -719,14 +786,10 @@ def backtest_day_ahead(df: pd.DataFrame, strategy_func) -> Dict[str, float]:
         logger.error(f"שגיאת Backtest: {e}")
         return {"Total_Return": 0.0, "Win_Rate": 0.0, "Avg_Pos": 0.0, "Avg_Neg": 0.0, "EV": 0.0}
 
-
 def backtest_multiday_with_costs(df: pd.DataFrame, strategy_func, hold_days: int = 5,
                                  commission_bps: float = 5.0, slippage_bps: float = 5.0) -> Dict[str, float]:
     """
-    Backtest רב-יומי עם עלויות (דו-צדדי: ק/מ):
-    - hold_days: מספר ימי החזקה לאחר איתות
-    - commission_bps/slippage_bps: Basis Points (1/100%)
-    מחזיר: Equity curve, WinRate, Avg trade, EV, MaxDD, Sharpe גס.
+    Backtest רב-יומי עם עלויות
     """
     try:
         if len(df) < 100:
@@ -782,7 +845,6 @@ def backtest_multiday_with_costs(df: pd.DataFrame, strategy_func, hold_days: int
         logger.error(f"שגיאת backtest_multiday_with_costs: {e}")
         return {"Trades": 0, "WinRate": 0.0, "EV": 0.0, "MaxDD": 0.0, "Sharpe": 0.0, "Equity": []}
 
-
 def monthly_backtest_report(tickers: List[str], hold_days: int = 5,
                             commission_bps: float = 5.0, slippage_bps: float = 5.0,
                             out_csv: str = "monthly_backtest_report.csv",
@@ -797,10 +859,25 @@ def monthly_backtest_report(tickers: List[str], hold_days: int = 5,
         di = calculate_indicators(df)
         if di is None:
             continue
-        b1 = backtest_multiday_with_costs(di, strategy_trend_following, hold_days, commission_bps, slippage_bps)
-        b2 = backtest_multiday_with_costs(di, strategy_mean_reversion, hold_days, commission_bps, slippage_bps)
-        b3 = backtest_multiday_with_costs(di, strategy_breakout, hold_days, commission_bps, slippage_bps)
-        best = max([b1, b2, b3], key=lambda x: x["EV"])
+        
+        # Backtest לכל האסטרטגיות
+        strategies = [
+            strategy_trend_following,
+            strategy_mean_reversion,
+            strategy_breakout,
+            strategy_volume_spike,
+            strategy_gap_trading,
+            strategy_support_resistance,
+            strategy_rsi_divergence,
+            strategy_momentum_reversal
+        ]
+        
+        results = []
+        for strategy in strategies:
+            bt = backtest_multiday_with_costs(di, strategy, hold_days, commission_bps, slippage_bps)
+            results.append(bt)
+        
+        best = max(results, key=lambda x: x["EV"])
         rows.append({
             "Ticker": t, "Trades": best["Trades"], "WinRate": best["WinRate"],
             "EV": best["EV"], "MaxDD": best["MaxDD"], "Sharpe": best["Sharpe"]
@@ -828,11 +905,9 @@ def monthly_backtest_report(tickers: List[str], hold_days: int = 5,
         plt.close()
     logger.info(f"דוח חודשי נשמר: {out_csv}, גרף: {out_png}")
 
-
 def weighted_score(row: pd.Series) -> float:
     """דירוג לפי EV (80%) + WinRate (20%)."""
     return 0.8 * float(row.get("Best_EV", 0.0)) + 0.2 * float(row.get("Best_WinRate", 0.0))
-
 
 # ===================== ניהול פוזיציה =====================
 
@@ -846,7 +921,6 @@ def position_size_by_atr(entry_price: float, atr: float) -> int:
     max_shares_by_cap = int((EQUITY * 0.2) // entry_price)  # לא יותר מ-20% הון לפוזיציה
     return max(0, min(shares, max_shares_by_cap))
 
-
 def trailing_stop_levels(entry: float, atr: float, side: str, multiple: float = 1.5) -> float:
     """Trailing Stop לפי ATR."""
     if atr <= 0:
@@ -856,7 +930,6 @@ def trailing_stop_levels(entry: float, atr: float, side: str, multiple: float = 
     elif side == "SELL":
         return entry + multiple * atr
     return entry
-
 
 _last_signal_date: Dict[str, Dict[str, datetime]] = {}
 _persist_cooldown_raw = _load_cooldown_state()
@@ -869,7 +942,6 @@ for _tkr, _m in _persist_cooldown_raw.items():
             pass
     if dmap:
         _last_signal_date[_tkr] = dmap
-
 
 # ===================== ויזואליזציה =====================
 
@@ -904,7 +976,6 @@ def visualize_signals(df: pd.DataFrame, ticker: str, final_signal: str):
         logger.info(f"נשמר תרשים: {out}")
     except Exception as e:
         logger.error(f"שגיאה בשרטוט {ticker}: {e}")
-
 
 # ===================== הלוגיקה הראשית =====================
 
@@ -978,12 +1049,18 @@ class AdvancedSwingTradingBot:
             if not passes_liquidity_filter(df):
                 return None
 
+            # כל האסטרטגיות
             s_trend = strategy_trend_following(df)
             s_mean = strategy_mean_reversion(df)
             s_break = strategy_breakout(df)
+            s_volume = strategy_volume_spike(df)
+            s_gap = strategy_gap_trading(df)
+            s_supres = strategy_support_resistance(df)
+            s_divergence = strategy_rsi_divergence(df)
+            s_momentum = strategy_momentum_reversal(df)
             s_ml = self.get_ml_signal(df)
 
-            signals = [s_trend, s_mean, s_break, s_ml]
+            signals = [s_trend, s_mean, s_break, s_volume, s_gap, s_supres, s_divergence, s_momentum, s_ml]
             final_signal = vote_final_signal(signals)
 
             if final_signal == "BUY" and not market_regime_long_allowed():
@@ -991,12 +1068,30 @@ class AdvancedSwingTradingBot:
             if final_signal == "SELL" and not market_regime_short_allowed():
                 final_signal = "HOLD"
 
+            # Backtest לכל האסטרטגיות
             bt_trend = backtest_day_ahead(df, strategy_func=strategy_trend_following)
             bt_mean  = backtest_day_ahead(df, strategy_func=strategy_mean_reversion)
             bt_break = backtest_day_ahead(df, strategy_func=strategy_breakout)
+            bt_volume = backtest_day_ahead(df, strategy_func=strategy_volume_spike)
+            bt_gap = backtest_day_ahead(df, strategy_func=strategy_gap_trading)
+            bt_supres = backtest_day_ahead(df, strategy_func=strategy_support_resistance)
+            bt_divergence = backtest_day_ahead(df, strategy_func=strategy_rsi_divergence)
+            bt_momentum = backtest_day_ahead(df, strategy_func=strategy_momentum_reversal)
 
-            best_ev = max(bt_trend["EV"], bt_mean["EV"], bt_break["EV"])
-            best_wr = max(bt_trend["Win_Rate"], bt_mean["Win_Rate"], bt_break["Win_Rate"])
+            all_ev = [
+                bt_trend["EV"], bt_mean["EV"], bt_break["EV"], 
+                bt_volume["EV"], bt_gap["EV"], bt_supres["EV"],
+                bt_divergence["EV"], bt_momentum["EV"]
+            ]
+            
+            all_wr = [
+                bt_trend["Win_Rate"], bt_mean["Win_Rate"], bt_break["Win_Rate"],
+                bt_volume["Win_Rate"], bt_gap["Win_Rate"], bt_supres["Win_Rate"],
+                bt_divergence["Win_Rate"], bt_momentum["Win_Rate"]
+            ]
+
+            best_ev = max(all_ev)
+            best_wr = max(all_wr)
 
             today = datetime.utcnow().date()
             ls = _last_signal_date.get(ticker, {})
@@ -1021,12 +1116,11 @@ class AdvancedSwingTradingBot:
                 "Trend_Signal": s_trend,
                 "Mean_Signal": s_mean,
                 "Breakout_Signal": s_break,
-                "Backtest_Trend": bt_trend["Total_Return"],
-                "Backtest_Trend_Win": bt_trend["Win_Rate"],
-                "Backtest_Mean": bt_mean["Total_Return"],
-                "Backtest_Mean_Win": bt_mean["Win_Rate"],
-                "Backtest_Breakout": bt_break["Total_Return"],
-                "Backtest_Breakout_Win": bt_break["Win_Rate"],
+                "Volume_Spike_Signal": s_volume,
+                "Gap_Trading_Signal": s_gap,
+                "Support_Resistance_Signal": s_supres,
+                "RSI_Divergence_Signal": s_divergence,
+                "Momentum_Reversal_Signal": s_momentum,
                 "Best_EV": best_ev,
                 "Best_WinRate": best_wr,
                 "Entry_Price": trade["Entry_Price"],
@@ -1186,7 +1280,6 @@ class AdvancedSwingTradingBot:
             elapsed = time.time() - start
             if elapsed > 600:
                 send_telegram_message(f"*אזהרה*: זמן ריצה {elapsed/60:.1f} דקות (>10 דק'). בדוק לוגים.")
-
 
 if __name__ == "__main__":
     bot = AdvancedSwingTradingBot()
